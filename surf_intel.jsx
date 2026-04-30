@@ -10,7 +10,7 @@ const SPOTS = [
   { id: "bolinas", name: "Bolinas", shortName: "Bolinas", lat: 37.9074, lon: -122.7174, type: "Point Break", difficulty: "Intermediate", city: "Marin", tideStationId: "9414958", tideStationLabel: "Bolinas Lagoon" },
   { id: "stinson", name: "Stinson Beach", shortName: "Stinson", lat: 37.8996, lon: -122.6416, type: "Beach Break", difficulty: "Beginner", city: "Marin", tideStationId: "9415020", tideStationLabel: "Point Reyes" },
   { id: "mavs", name: "Mavericks", shortName: "Mavs", lat: 37.4953, lon: -122.5003, type: "Reef Break", difficulty: "Expert Only", city: "Half Moon Bay", tideStationId: "9414131", tideStationLabel: "Pillar Point Harbor" },
-  { id: "pleasure_point", name: "Pleasure Point", shortName: "PP", lat: 36.9569, lon: -121.9817, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
+  { id: "pleasure_point", name: "Pleasure Point", shortName: "Pleasure P", lat: 36.9569, lon: -121.9817, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
 ];
 
 const BOARDS = [
@@ -38,8 +38,13 @@ const THEME = {
   accentSoft: "rgba(43,183,167,0.16)",
 };
 
+const SCENIC_BG_URL = "/surf-bg.png";
+
 const POSTCARD_BG = `
-  radial-gradient(circle at 18% 14%, rgba(255,255,255,0.72) 0%, rgba(255,255,255,0) 32%),
+  linear-gradient(180deg, rgba(232,247,255,0.72) 0%, rgba(222,242,248,0.76) 42%, rgba(247,237,214,0.8) 100%),
+  radial-gradient(circle at 18% 14%, rgba(255,255,255,0.78) 0%, rgba(255,255,255,0.18) 34%),
+  linear-gradient(180deg, rgba(9, 55, 74, 0.08) 0%, rgba(9, 55, 74, 0.04) 60%, rgba(9, 55, 74, 0.02) 100%),
+  url("${SCENIC_BG_URL}"),
   linear-gradient(
     180deg,
     #b9ecff 0%,
@@ -92,6 +97,20 @@ const getRating = (heightM, periodS) => {
   return       { label: "MAXING",  color: "#c0392b" };
 };
 
+const getRatingDisplayColor = label => {
+  const map = {
+    FLAT: "#d73027",
+    SMALL: "#f46d43",
+    WEAK: "#fdae61",
+    FUN: "#66bd63",
+    SOLID: "#1a9850",
+    EPIC: "#1a9850",
+    PUMPING: "#0b7d3e",
+    MAXING: "#0a5f30",
+  };
+  return map[label] || THEME.textSoft;
+};
+
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const fetchMarine = (lat, lon) =>
@@ -109,6 +128,142 @@ const fetchTides = stationId => {
   const fmt = x => `${x.getFullYear()}${pad(x.getMonth()+1)}${pad(x.getDate())}`;
   return fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(d)}&end_date=${fmt(t)}&station=${stationId}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=hilo&units=english&application=cs153&format=json`)
     .then(r => r.json());
+};
+
+const formatDriveDuration = totalSeconds => {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return null;
+  const mins = Math.round(totalSeconds / 60);
+  if (mins < 60) return `${mins} min`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins ? `${hours} hr ${remMins} min` : `${hours} hr`;
+};
+
+const parseLatLonString = value => {
+  const m = String(value || "").trim().match(/^(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)$/);
+  if (!m) return null;
+  const lat = Number(m[1]);
+  const lon = Number(m[3]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+};
+
+const tomTomLabel = (result, fallback = "") =>
+  result?.address?.freeformAddress ||
+  [result?.address?.municipality, result?.address?.countrySubdivision, result?.address?.country]
+    .filter(Boolean)
+    .join(", ") ||
+  fallback;
+
+const fetchTomTomLocationOptions = async (query, apiKey) => {
+  const parsed = parseLatLonString(query);
+  if (parsed) {
+    return [{
+      lat: parsed.lat,
+      lon: parsed.lon,
+      label: `${parsed.lat.toFixed(5)},${parsed.lon.toFixed(5)}`,
+    }];
+  }
+
+  const cleaned = String(query || "").trim();
+  if (!cleaned) return [];
+  const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(cleaned)}.json?key=${encodeURIComponent(apiKey)}&limit=8`;
+  try {
+    const res = await fetch(url);
+    const json = await res.json().catch(() => ({}));
+    const results = (json?.results || []).filter(r => r?.position);
+    return results.map(r => ({
+      lat: r.position.lat,
+      lon: r.position.lon,
+      label: tomTomLabel(r, cleaned),
+    }));
+  } catch {
+    return [];
+  }
+};
+
+const resolveTomTomLocation = async (origin, apiKey) => {
+  const options = await fetchTomTomLocationOptions(origin, apiKey);
+  return options[0] || null;
+};
+
+const resolveTomTomOrigin = async (origin, apiKey) => {
+  const loc = await resolveTomTomLocation(origin, apiKey);
+  return loc ? { lat: loc.lat, lon: loc.lon } : null;
+};
+
+const fetchDriveTimes = async (spots, originInput) => {
+  const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+  const origin = (originInput || import.meta.env.VITE_DRIVE_ORIGIN || "San Francisco, CA").trim();
+  if (!apiKey || !origin || !spots?.length) return {};
+  const originCoords = await resolveTomTomOrigin(origin, apiKey);
+  if (!originCoords) return {};
+
+  const requests = spots.map(async spot => {
+    const routePath = `${originCoords.lat},${originCoords.lon}:${spot.lat},${spot.lon}`;
+    const url = `https://api.tomtom.com/routing/1/calculateRoute/${routePath}/json?key=${encodeURIComponent(apiKey)}&travelMode=car&traffic=true&departAt=now`;
+    try {
+      const res = await fetch(url);
+      const json = await res.json().catch(() => ({}));
+      const summary = json?.routes?.[0]?.summary;
+      if (!summary) return [spot.id, null];
+      const totalSeconds = summary.travelTimeInSeconds || 0;
+      return [spot.id, formatDriveDuration(totalSeconds)];
+    } catch {
+      return [spot.id, null];
+    }
+  });
+
+  const entries = await Promise.all(requests);
+  return Object.fromEntries(entries);
+};
+
+const fetchMissingDriveTimes = async (spots, existingDriveTimes = {}, originInput) => {
+  const missing = spots.filter(s => !existingDriveTimes[s.id]);
+  if (!missing.length) return {};
+  return fetchDriveTimes(missing, originInput);
+};
+
+const buildSpotCondition = (spot, marineJson, windJson) => {
+  if (!marineJson?.hourly) return null;
+  const hi = getCurrentHourIdx(marineJson.hourly.time);
+  const wi = alignHourIdx(marineJson.hourly.time, windJson?.hourly?.time, hi);
+  const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
+  return {
+    waveHeight:  marineJson.hourly.wave_height?.[hi]          ?? 0,
+    wavePeriod:  marineJson.hourly.wave_period?.[hi]          ?? 0,
+    waveDir:     marineJson.hourly.wave_direction?.[hi]        ?? 0,
+    swellHeight: marineJson.hourly.swell_wave_height?.[hi]    ?? 0,
+    swellPeriod: marineJson.hourly.swell_wave_period?.[hi]    ?? 0,
+    swellDir:    marineJson.hourly.swell_wave_direction?.[hi] ?? 0,
+    windSpeed:   windJson?.hourly?.wind_speed_10m?.[wi]       ?? 0,
+    windDir:     windJson?.hourly?.wind_direction_10m?.[wi]   ?? 0,
+    times:       sl(marineJson.hourly.time, hi),
+    forecastWave: sl(marineJson.hourly.wave_height, hi),
+    forecastWind: sl(windJson?.hourly?.wind_speed_10m, wi),
+  };
+};
+
+const fetchSpotCondition = async spot => {
+  try {
+    const marine = await fetchMarine(spot.lat, spot.lon).catch(() => null);
+    if (!marine?.hourly) return null;
+    const lat = marine?.latitude ?? spot.lat;
+    const lon = marine?.longitude ?? spot.lon;
+    const wind = await fetchWind(lat, lon).catch(() => null);
+    return buildSpotCondition(spot, marine, wind);
+  } catch {
+    return null;
+  }
+};
+
+const fetchMissingSpotData = async (spots, existingSpotData = {}) => {
+  const missing = spots.filter(s => !existingSpotData[s.id]);
+  if (!missing.length) return {};
+  const pairs = await Promise.all(
+    missing.map(async spot => [spot.id, await fetchSpotCondition(spot)])
+  );
+  return Object.fromEntries(pairs.filter(([, v]) => !!v));
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -214,33 +369,63 @@ function WindCompass({ deg, speed }) {
 
 // ─── Screens ─────────────────────────────────────────────────────────────────
 
-function SetupScreen({ skill, setSkill, quiver, toggleBoard, customBoard, setCustomBoard, onSubmit }) {
+function SetupScreen({
+  skill,
+  setSkill,
+  quiver,
+  toggleBoard,
+  customBoard,
+  setCustomBoard,
+  driveOrigin,
+  setDriveOrigin,
+  driveOriginStatus,
+  driveOriginOptions,
+  driveOriginOptionsLoading,
+  showDriveOriginOptions,
+  onDriveOriginFocus,
+  onDriveOriginSelect,
+  onDriveOriginBlur,
+  onSubmit,
+}) {
   return (
-    <div style={{ minHeight: "100vh", background: POSTCARD_BG, padding: "48px 24px", fontFamily: "'Inter', sans-serif" }}>
+    <div style={{
+      height: "100vh",
+      backgroundImage: POSTCARD_BG,
+      backgroundSize: "cover",
+      backgroundPosition: "center",
+      backgroundRepeat: "no-repeat",
+      backgroundAttachment: "fixed",
+      padding: "18px 20px",
+      fontFamily: "'Inter', sans-serif",
+      display: "flex",
+      flexDirection: "column",
+      justifyContent: "center",
+      overflow: "hidden",
+    }}>
       <style>{FONTS}</style>
-      <div style={{ textAlign: "center", marginBottom: 52 }}>
-        <div style={{ letterSpacing: 10, fontSize: 10, color: THEME.accent, marginBottom: 16 }}>BAY AREA</div>
-        <h1 style={{ fontFamily: "'Playfair Display', serif", fontSize: 52, color: THEME.textStrong, margin: 0, fontWeight: 700, letterSpacing: -1 }}>
+      <div style={{ textAlign: "center", marginBottom: 22 }}>
+        <div style={{ letterSpacing: 8, fontSize: 9, color: THEME.accent, marginBottom: 10 }}>BAY AREA</div>
+        <h1 style={{ fontFamily: "'Playfair Display', serif", fontSize: 40, color: THEME.textStrong, margin: 0, fontWeight: 700, letterSpacing: -0.6, lineHeight: 1 }}>
           SURF INTEL
         </h1>
-        <p style={{ color: THEME.textSoft, fontSize: 13, marginTop: 10, letterSpacing: 1 }}>
+        <p style={{ color: THEME.textSoft, fontSize: 12, marginTop: 6, letterSpacing: 0.8 }}>
           Live swell · NOAA tides · AI coaching
         </p>
       </div>
 
-      <div style={{ maxWidth: 580, margin: "0 auto" }}>
+      <div style={{ maxWidth: 680, width: "100%", margin: "0 auto" }}>
 
         {/* Skill */}
-        <div style={{ marginBottom: 36 }}>
-          <div style={{ fontSize: 9, letterSpacing: 4, color: THEME.accent, marginBottom: 14 }}>YOUR SKILL LEVEL</div>
-          <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.accent, marginBottom: 8 }}>YOUR SKILL LEVEL</div>
+          <div style={{ display: "flex", gap: 8 }}>
             {SKILLS.map(s => (
               <button key={s} onClick={() => setSkill(s)} style={{
-                flex: 1, padding: "11px 0",
+                flex: 1, padding: "9px 0",
                 border: skill === s ? `1px solid ${THEME.accent}` : `1px solid ${THEME.border}`,
                 background: skill === s ? THEME.accentSoft : THEME.panel,
                 color: skill === s ? THEME.accent : THEME.text,
-                borderRadius: 6, fontSize: 12, cursor: "pointer", fontFamily: "'Space Mono', monospace",
+                borderRadius: 6, fontSize: 11, cursor: "pointer", fontFamily: "'Space Mono', monospace",
                 transition: "all 0.15s",
               }}>{s}</button>
             ))}
@@ -248,23 +433,23 @@ function SetupScreen({ skill, setSkill, quiver, toggleBoard, customBoard, setCus
         </div>
 
         {/* Quiver */}
-        <div style={{ marginBottom: 36 }}>
-          <div style={{ fontSize: 9, letterSpacing: 4, color: THEME.accent, marginBottom: 14 }}>
-            YOUR QUIVER <span style={{ color: THEME.textSoft, letterSpacing: 0, fontFamily: "'Inter', sans-serif", fontSize: 10 }}>— select all you own</span>
+        <div style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.accent, marginBottom: 8 }}>
+            YOUR QUIVER <span style={{ color: THEME.textSoft, letterSpacing: 0, fontFamily: "'Inter', sans-serif", fontSize: 9 }}>— select all you own</span>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
             {BOARDS.map(b => {
               const sel = quiver.includes(b.id);
               return (
                 <button key={b.id} onClick={() => toggleBoard(b.id)} style={{
-                  padding: "14px 12px", textAlign: "left",
+                  padding: "10px 10px", textAlign: "left",
                   border: sel ? `1px solid ${THEME.accent}` : `1px solid ${THEME.border}`,
                   background: sel ? THEME.accentSoft : THEME.panel,
                   borderRadius: 8, cursor: "pointer", transition: "all 0.15s",
                 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: sel ? THEME.accent : THEME.text, marginBottom: 4 }}>{b.name}</div>
-                  <div style={{ fontSize: 10, color: sel ? "#3a9f95" : THEME.textSoft, fontFamily: "'Space Mono', monospace" }}>{b.size}</div>
-                  <div style={{ fontSize: 10, color: THEME.muted, marginTop: 4 }}>{b.desc}</div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: sel ? THEME.accent : THEME.text, marginBottom: 2 }}>{b.name}</div>
+                  <div style={{ fontSize: 9, color: sel ? "#3a9f95" : THEME.textSoft, fontFamily: "'Space Mono', monospace" }}>{b.size}</div>
+                  <div style={{ fontSize: 9, color: THEME.muted, marginTop: 2 }}>{b.desc}</div>
                 </button>
               );
             })}
@@ -273,22 +458,84 @@ function SetupScreen({ skill, setSkill, quiver, toggleBoard, customBoard, setCus
             value={customBoard} onChange={e => setCustomBoard(e.target.value)}
             placeholder={"+ Custom board (e.g. 6'8\" step-up twin)"}
             style={{
-              width: "100%", marginTop: 10, padding: "11px 14px", boxSizing: "border-box",
+              width: "100%", marginTop: 7, padding: "9px 12px", boxSizing: "border-box",
               background: THEME.panel, border: `1px solid ${THEME.border}`,
-              borderRadius: 6, color: THEME.text, fontSize: 12, outline: "none",
+              borderRadius: 6, color: THEME.text, fontSize: 11, outline: "none",
               fontFamily: "'Space Mono', monospace",
             }}
           />
         </div>
 
+        {/* Drive origin */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.accent, marginBottom: 6 }}>
+            YOUR START LOCATION
+          </div>
+          <input
+            value={driveOrigin}
+            onChange={e => setDriveOrigin(e.target.value)}
+            onFocus={onDriveOriginFocus}
+            onBlur={onDriveOriginBlur}
+            placeholder={"Enter address or lat,lon (e.g. 37.7749,-122.4194)"}
+            style={{
+              width: "100%", padding: "9px 12px", boxSizing: "border-box",
+              background: THEME.panel, border: `1px solid ${THEME.border}`,
+              borderRadius: 6, color: THEME.text, fontSize: 11, outline: "none",
+              fontFamily: "'Space Mono', monospace",
+            }}
+          />
+          {showDriveOriginOptions && (
+            <div style={{
+              marginTop: 6,
+              border: `1px solid ${THEME.border}`,
+              borderRadius: 6,
+              overflow: "hidden",
+              background: "rgba(255,255,255,0.95)",
+              maxHeight: 120,
+              overflowY: "auto",
+            }}>
+              {driveOriginOptionsLoading ? (
+                <div style={{ fontSize: 11, color: THEME.textSoft, padding: "10px 12px" }}>Searching locations...</div>
+              ) : driveOriginOptions.length ? (
+                driveOriginOptions.map((opt, i) => (
+                  <button
+                    key={`${opt.label}-${i}`}
+                    onMouseDown={e => {
+                      e.preventDefault();
+                      onDriveOriginSelect(opt);
+                    }}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "10px 12px",
+                      border: "none",
+                      borderBottom: i === driveOriginOptions.length - 1 ? "none" : `1px solid ${THEME.border}`,
+                      background: "transparent",
+                      color: THEME.text,
+                      fontSize: 11,
+                      cursor: "pointer",
+                      fontFamily: "'Inter', sans-serif",
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))
+              ) : (
+                <div style={{ fontSize: 11, color: THEME.textSoft, padding: "10px 12px" }}>No matches yet.</div>
+              )}
+            </div>
+          )}
+          <div style={{ fontSize: 9, color: THEME.textSoft, marginTop: 5 }}>{driveOriginStatus || "Drive times will be calculated from this location."}</div>
+        </div>
+
         <button onClick={onSubmit} style={{
-          width: "100%", padding: "17px 0", background: THEME.accent, border: "none",
-          borderRadius: 8, color: "#ffffff", fontSize: 12, fontWeight: 700,
-          letterSpacing: 4, cursor: "pointer", fontFamily: "'Space Mono', monospace",
+          width: "100%", padding: "13px 0", background: THEME.accent, border: "none",
+          borderRadius: 8, color: "#ffffff", fontSize: 11, fontWeight: 700,
+          letterSpacing: 3, cursor: "pointer", fontFamily: "'Space Mono', monospace",
           transition: "opacity 0.15s",
         }}>FETCH CONDITIONS →</button>
 
-        <p style={{ textAlign: "center", fontSize: 10, color: THEME.textSoft, marginTop: 20, letterSpacing: 1 }}>
+        <p style={{ textAlign: "center", fontSize: 9, color: THEME.textSoft, marginTop: 10, letterSpacing: 0.8 }}>
           Open-Meteo Marine API · NOAA CO-OPS (nearest station per spot) · Claude AI
         </p>
       </div>
@@ -304,7 +551,13 @@ function LoadingScreen({ spotCount }) {
   }, []);
   return (
     <div style={{
-      minHeight: "100vh", background: POSTCARD_BG, display: "flex",
+      minHeight: "100vh",
+      backgroundImage: POSTCARD_BG,
+      backgroundSize: "cover",
+      backgroundPosition: "center",
+      backgroundRepeat: "no-repeat",
+      backgroundAttachment: "fixed",
+      display: "flex",
       flexDirection: "column", alignItems: "center", justifyContent: "center",
     }}>
       <style>{FONTS}</style>
@@ -334,7 +587,7 @@ function LoadingScreen({ spotCount }) {
   );
 }
 
-function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation, aiRec, skill, quiver, onRefresh }) {
+function Dashboard({ spots, spotData, driveTimes, activeSpot, setActiveSpot, tidesByStation, aiRec, skill, quiver, onRefresh }) {
   const data = spotData[activeSpot.id];
   const spotTides = tidesByStation[activeSpot.tideStationId] || [];
   const rating = data ? getRating(data.waveHeight, data.wavePeriod) : null;
@@ -349,13 +602,26 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
   const dateStr = now.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
 
   return (
-    <div style={{ height: "100vh", background: POSTCARD_BG, color: THEME.text, fontFamily: "'Inter', sans-serif", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div style={{
+      height: "100vh",
+      backgroundImage: POSTCARD_BG,
+      backgroundSize: "cover",
+      backgroundPosition: "center",
+      backgroundRepeat: "no-repeat",
+      backgroundAttachment: "fixed",
+      color: THEME.text,
+      fontFamily: "'Inter', sans-serif",
+      display: "flex",
+      flexDirection: "column",
+      overflow: "hidden",
+    }}>
       <style>{FONTS}</style>
 
       {/* ── Top bar ── */}
       <div style={{
         padding: "0 24px", height: 52, display: "flex", alignItems: "center",
         justifyContent: "space-between", borderBottom: `1px solid ${THEME.border}`, flexShrink: 0,
+        background: "rgba(255,255,255,0.72)", backdropFilter: "blur(4px)",
       }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 14 }}>
           <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 20, color: THEME.textStrong }}>SURF INTEL</span>
@@ -375,10 +641,18 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
 
         {/* ── Spot sidebar ── */}
-        <div style={{ width: 188, borderRight: `1px solid ${THEME.border}`, overflowY: "auto", flexShrink: 0 }}>
+        <div style={{
+          width: 188,
+          borderRight: `1px solid ${THEME.border}`,
+          overflowY: "auto",
+          flexShrink: 0,
+          background: "rgba(255,255,255,0.6)",
+          backdropFilter: "blur(3px)",
+        }}>
           {spots.map(spot => {
             const d = spotData[spot.id];
             const r = d ? getRating(d.waveHeight, d.wavePeriod) : null;
+            const drive = driveTimes[spot.id];
             const active = spot.id === activeSpot.id;
             return (
               <div key={spot.id} onClick={() => setActiveSpot(spot)} style={{
@@ -390,13 +664,29 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
                   <div style={{ fontSize: 13, fontWeight: 600, color: active ? THEME.textStrong : THEME.textSoft }}>{spot.shortName}</div>
-                  {r && <div style={{ fontSize: 8, color: r.color, fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>{r.label}</div>}
+                  {r && (
+                    <div style={{
+                      fontSize: 11,
+                      color: getRatingDisplayColor(r.label),
+                      fontFamily: "'Space Mono', monospace",
+                      fontWeight: 700,
+                      letterSpacing: 0.8,
+                      lineHeight: 1,
+                    }}>
+                      {r.label}
+                    </div>
+                  )}
                 </div>
                 <div style={{ fontSize: 9, color: THEME.muted, marginBottom: 5 }}>{spot.type} · {spot.city}</div>
                 {d ? (
-                  <div style={{ fontSize: 11, color: THEME.text, fontFamily: "'Space Mono', monospace" }}>
-                    {fmtFt(d.waveHeight)}ft @ {d.wavePeriod?.toFixed(0)}s
-                  </div>
+                  <>
+                    <div style={{ fontSize: 11, color: THEME.text, fontFamily: "'Space Mono', monospace" }}>
+                      {fmtFt(d.waveHeight)}ft @ {d.wavePeriod?.toFixed(0)}s
+                    </div>
+                    <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+                      {drive ? `${drive} drive` : "Drive time —"}
+                    </div>
+                  </>
                 ) : (
                   <div style={{ fontSize: 10, color: "#1a2a3a" }}>—</div>
                 )}
@@ -406,7 +696,13 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
         </div>
 
         {/* ── Main panel ── */}
-        <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+        <div style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: 24,
+          background: "rgba(249,253,255,0.42)",
+          backdropFilter: "blur(2px)",
+        }}>
           {data ? (
             <>
               {/* Spot header */}
@@ -423,6 +719,9 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
                     fontWeight: 700, letterSpacing: 3, border: `1px solid ${rating?.color}20`,
                     padding: "4px 12px", borderRadius: 3, background: `${rating?.color}10`,
                   }}>{rating?.label}</div>
+                  <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", letterSpacing: 1.5 }}>
+                    {driveTimes[activeSpot.id] ? `${driveTimes[activeSpot.id]} DRIVE` : "DRIVE TIME —"}
+                  </div>
                 </div>
               </div>
 
@@ -527,6 +826,7 @@ function Dashboard({ spots, spotData, activeSpot, setActiveSpot, tidesByStation,
               "Open-Meteo Marine API",
               "Open-Meteo Forecast API",
               "NOAA CO-OPS Tides",
+              "TomTom Routing API",
               "Anthropic Claude Sonnet",
             ].map(s => (
               <div key={s} style={{ fontSize: 9, color: THEME.muted, marginBottom: 4 }}>· {s}</div>
@@ -550,12 +850,65 @@ export default function App() {
   const [skill, setSkill] = useState("Intermediate");
   const [quiver, setQuiver] = useState(["longboard", "shortboard"]);
   const [customBoard, setCustomBoard] = useState("");
+  const [driveOrigin, setDriveOrigin] = useState((import.meta.env.VITE_DRIVE_ORIGIN || "San Francisco, CA").trim());
+  const [driveOriginResolved, setDriveOriginResolved] = useState(null);
+  const [driveOriginStatus, setDriveOriginStatus] = useState("");
+  const [driveOriginOptions, setDriveOriginOptions] = useState([]);
+  const [driveOriginOptionsLoading, setDriveOriginOptionsLoading] = useState(false);
+  const [showDriveOriginOptions, setShowDriveOriginOptions] = useState(false);
   const [spotData, setSpotData] = useState({});
+  const [driveTimes, setDriveTimes] = useState({});
+  const [spotRetryTick, setSpotRetryTick] = useState(0);
   const [tidesByStation, setTidesByStation] = useState({});
   const [activeSpot, setActiveSpot] = useState(SPOTS[0]);
   const [aiRec, setAiRec] = useState({ text: "", loading: false });
+  const [driveRetryTick, setDriveRetryTick] = useState(0);
 
   const toggleBoard = id => setQuiver(q => q.includes(id) ? q.filter(x => x !== id) : [...q, id]);
+
+  const resolveAndAutofillDriveOrigin = async () => {
+    const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+    const raw = driveOrigin.trim();
+    if (!raw || !apiKey) return null;
+    setDriveOriginStatus("Resolving location...");
+    const resolved = await resolveTomTomLocation(raw, apiKey);
+    if (!resolved) {
+      setDriveOriginResolved(null);
+      setDriveOriginStatus("Could not validate location. Try a fuller address.");
+      return null;
+    }
+    setDriveOriginResolved({ lat: resolved.lat, lon: resolved.lon });
+    if (resolved.label && resolved.label !== raw) setDriveOrigin(resolved.label);
+    setDriveOriginStatus(`Using: ${resolved.label}`);
+    return resolved;
+  };
+
+  const handleDriveOriginSelect = opt => {
+    setDriveOrigin(opt.label);
+    setDriveOriginResolved({ lat: opt.lat, lon: opt.lon });
+    setDriveOriginStatus(`Using: ${opt.label}`);
+    setShowDriveOriginOptions(false);
+  };
+
+  useEffect(() => {
+    if (screen !== "setup") return;
+    const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+    const q = driveOrigin.trim();
+    if (!showDriveOriginOptions || !apiKey || q.length < 2) {
+      setDriveOriginOptions([]);
+      setDriveOriginOptionsLoading(false);
+      return;
+    }
+
+    setDriveOriginOptionsLoading(true);
+    const timer = setTimeout(async () => {
+      const opts = await fetchTomTomLocationOptions(q, apiKey);
+      setDriveOriginOptions(opts);
+      setDriveOriginOptionsLoading(false);
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [driveOrigin, showDriveOriginOptions, screen]);
 
   const callAI = async (data, tideData) => {
     setAiRec({ text: "", loading: true });
@@ -646,6 +999,9 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       const tideJsons = await Promise.all(
         uniqueTideIds.map(id => fetchTides(id).catch(() => ({ predictions: [] })))
       );
+      const resolved = driveOriginResolved || await resolveAndAutofillDriveOrigin();
+      const originForRouting = resolved ? `${resolved.lat},${resolved.lon}` : driveOrigin;
+      const nextDriveTimes = await fetchDriveTimes(SPOTS, originForRouting);
       const nextTidesByStation = {};
       uniqueTideIds.forEach((id, i) => {
         nextTidesByStation[id] = tideJsons[i]?.predictions || [];
@@ -653,27 +1009,13 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
 
       const data = {};
       SPOTS.forEach((spot, i) => {
-        const m = marines[i], w = winds[i];
-        if (!m?.hourly) { data[spot.id] = null; return; }
-        const hi = getCurrentHourIdx(m.hourly.time);
-        const wi = alignHourIdx(m.hourly.time, w?.hourly?.time, hi);
-        const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
-        data[spot.id] = {
-          waveHeight:  m.hourly.wave_height?.[hi]          ?? 0,
-          wavePeriod:  m.hourly.wave_period?.[hi]          ?? 0,
-          waveDir:     m.hourly.wave_direction?.[hi]        ?? 0,
-          swellHeight: m.hourly.swell_wave_height?.[hi]    ?? 0,
-          swellPeriod: m.hourly.swell_wave_period?.[hi]    ?? 0,
-          swellDir:    m.hourly.swell_wave_direction?.[hi] ?? 0,
-          windSpeed:   w?.hourly?.wind_speed_10m?.[wi]     ?? 0,
-          windDir:     w?.hourly?.wind_direction_10m?.[wi] ?? 0,
-          times:       sl(m.hourly.time, hi),
-          forecastWave: sl(m.hourly.wave_height, hi),
-          forecastWind: sl(w?.hourly?.wind_speed_10m, wi),
-        };
+        data[spot.id] = buildSpotCondition(spot, marines[i], winds[i]);
       });
 
       setSpotData(data);
+      setSpotRetryTick(0);
+      setDriveTimes(nextDriveTimes);
+      setDriveRetryTick(0);
       setTidesByStation(nextTidesByStation);
       setScreen("dashboard");
       callAI(data, nextTidesByStation);
@@ -683,15 +1025,71 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     }
   };
 
+  useEffect(() => {
+    if (screen !== "dashboard") return;
+    const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+    if (!apiKey) return;
+    const unresolvedCount = SPOTS.filter(s => !driveTimes[s.id]).length;
+    if (unresolvedCount === 0) return;
+    if (driveRetryTick >= 6) return; // Stop after ~1 minute of retries.
+
+    const timer = setTimeout(async () => {
+      const originForRetry = driveOriginResolved
+        ? `${driveOriginResolved.lat},${driveOriginResolved.lon}`
+        : driveOrigin;
+      const recovered = await fetchMissingDriveTimes(SPOTS, driveTimes, originForRetry);
+      if (Object.keys(recovered).length) {
+        setDriveTimes(prev => ({ ...prev, ...recovered }));
+      }
+      setDriveRetryTick(t => t + 1);
+    }, 10000);
+
+    return () => clearTimeout(timer);
+  }, [screen, driveTimes, driveRetryTick, driveOrigin, driveOriginResolved]);
+
+  useEffect(() => {
+    if (screen !== "dashboard") return;
+    const unresolvedCount = SPOTS.filter(s => !spotData[s.id]).length;
+    if (unresolvedCount === 0) return;
+    if (spotRetryTick >= 6) return; // Stop after ~1 minute of retries.
+
+    const timer = setTimeout(async () => {
+      const recovered = await fetchMissingSpotData(SPOTS, spotData);
+      if (Object.keys(recovered).length) {
+        setSpotData(prev => ({ ...prev, ...recovered }));
+      }
+      setSpotRetryTick(t => t + 1);
+    }, 10000);
+
+    return () => clearTimeout(timer);
+  }, [screen, spotData, spotRetryTick]);
+
   if (screen === "setup") return (
     <SetupScreen skill={skill} setSkill={setSkill} quiver={quiver}
       toggleBoard={toggleBoard} customBoard={customBoard}
-      setCustomBoard={setCustomBoard} onSubmit={loadData} />
+      setCustomBoard={setCustomBoard} driveOrigin={driveOrigin}
+      setDriveOrigin={value => {
+        setDriveOrigin(value);
+        setDriveOriginResolved(null);
+        setDriveOriginStatus("");
+        setShowDriveOriginOptions(true);
+      }}
+      driveOriginStatus={driveOriginStatus}
+      driveOriginOptions={driveOriginOptions}
+      driveOriginOptionsLoading={driveOriginOptionsLoading}
+      showDriveOriginOptions={showDriveOriginOptions}
+      onDriveOriginFocus={() => setShowDriveOriginOptions(true)}
+      onDriveOriginSelect={handleDriveOriginSelect}
+      onDriveOriginBlur={() => {
+        setTimeout(() => setShowDriveOriginOptions(false), 120);
+        resolveAndAutofillDriveOrigin();
+      }}
+      onSubmit={loadData} />
   );
   if (screen === "loading") return <LoadingScreen spotCount={SPOTS.length} />;
 
   return (
-    <Dashboard spots={SPOTS} spotData={spotData} activeSpot={activeSpot}
+    <Dashboard spots={SPOTS} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
       setActiveSpot={setActiveSpot} tidesByStation={tidesByStation} aiRec={aiRec}
       skill={skill} quiver={quiver} onRefresh={() => callAI(spotData, tidesByStation)} />
   );
