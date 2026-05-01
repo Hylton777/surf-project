@@ -10,7 +10,7 @@ const SPOTS = [
   { id: "bolinas", name: "Bolinas", shortName: "Bolinas", lat: 37.9074, lon: -122.7174, type: "Point Break", difficulty: "Intermediate", city: "Marin", tideStationId: "9414958", tideStationLabel: "Bolinas Lagoon" },
   { id: "stinson", name: "Stinson Beach", shortName: "Stinson", lat: 37.8996, lon: -122.6416, type: "Beach Break", difficulty: "Beginner", city: "Marin", tideStationId: "9415020", tideStationLabel: "Point Reyes" },
   { id: "mavs", name: "Mavericks", shortName: "Mavs", lat: 37.4953, lon: -122.5003, type: "Reef Break", difficulty: "Expert Only", city: "Half Moon Bay", tideStationId: "9414131", tideStationLabel: "Pillar Point Harbor" },
-  { id: "pleasure_point", name: "Pleasure Point", shortName: "Pleasure P", lat: 36.9569, lon: -121.9817, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
+  { id: "pleasure_point", name: "Pleasure Point", shortName: "Pleasure Point", lat: 36.9569, lon: -121.9817, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
 ];
 
 const BOARDS = [
@@ -59,6 +59,7 @@ const POSTCARD_BG = `
 
 const mToFt = m => m * 3.28084;
 const fmtFt = (m, d = 1) => mToFt(m).toFixed(d);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const degToCompass = deg => {
   const dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
@@ -109,6 +110,23 @@ const getRatingDisplayColor = label => {
     MAXING: "#0a5f30",
   };
   return map[label] || THEME.textSoft;
+};
+
+const isLikelyTransientAiError = msg => {
+  const m = String(msg || "").toLowerCase();
+  return (
+    m.includes("enotfound") ||
+    m.includes("etimedout") ||
+    m.includes("econnreset") ||
+    m.includes("eai_again") ||
+    m.includes("dns") ||
+    m.includes("network") ||
+    m.includes("fetch failed") ||
+    m.includes("502") ||
+    m.includes("503") ||
+    m.includes("504") ||
+    m.includes("429")
+  );
 };
 
 // ─── API ─────────────────────────────────────────────────────────────────────
@@ -782,7 +800,12 @@ function Dashboard({ spots, spotData, driveTimes, activeSpot, setActiveSpot, tid
 
           {aiRec.loading ? (
             <div>
-              <div style={{ fontSize: 11, color: THEME.textSoft, marginBottom: 12 }}>Analyzing conditions…</div>
+              <div style={{ fontSize: 11, color: THEME.textSoft, marginBottom: 6 }}>Showing AI recommendation…</div>
+              {aiRec.retryAttempt > 1 && (
+                <div style={{ fontSize: 10, color: THEME.muted, marginBottom: 12, fontFamily: "'Space Mono', monospace" }}>
+                  Retrying AI recommendation ({aiRec.retryAttempt}/{aiRec.maxAttempts})…
+                </div>
+              )}
               {[100, 80, 90, 70, 85].map((w, i) => (
                 <div key={i} style={{
                   height: 10, background: "#d5edf4", borderRadius: 3, marginBottom: 8,
@@ -861,7 +884,7 @@ export default function App() {
   const [spotRetryTick, setSpotRetryTick] = useState(0);
   const [tidesByStation, setTidesByStation] = useState({});
   const [activeSpot, setActiveSpot] = useState(SPOTS[0]);
-  const [aiRec, setAiRec] = useState({ text: "", loading: false });
+  const [aiRec, setAiRec] = useState({ text: "", loading: false, retryAttempt: 1, maxAttempts: 1 });
   const [driveRetryTick, setDriveRetryTick] = useState(0);
 
   const toggleBoard = id => setQuiver(q => q.includes(id) ? q.filter(x => x !== id) : [...q, id]);
@@ -911,7 +934,7 @@ export default function App() {
   }, [driveOrigin, showDriveOriginOptions, screen]);
 
   const callAI = async (data, tideData) => {
-    setAiRec({ text: "", loading: true });
+    setAiRec({ text: "", loading: true, retryAttempt: 1, maxAttempts: 1 });
 
     const quiverDesc = [
       ...quiver.map(id => BOARDS.find(b => b.id === id)?.name || id),
@@ -936,19 +959,23 @@ export default function App() {
     const primaryModel = (import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
     const fallbackModel = (import.meta.env.VITE_ANTHROPIC_FALLBACK_MODEL || "claude-sonnet-4-6").trim();
     const modelChain = [...new Set([primaryModel, fallbackModel].filter(Boolean))];
+    const maxAttempts = 3;
+    setAiRec({ text: "", loading: true, retryAttempt: 1, maxAttempts });
 
     try {
       let lastErr = "Unknown AI error";
-      for (const model of modelChain) {
-        const res = await fetch(anthropicUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model,
-            max_tokens: 1000,
-            messages: [{
-              role: "user",
-              content: `You are an expert Bay Area surf coach giving a concise, direct session recommendation. Use real surf lingo.
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        setAiRec(prev => ({ ...prev, loading: true, retryAttempt: attempt, maxAttempts }));
+        for (const model of modelChain) {
+          const res = await fetch(anthropicUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model,
+              max_tokens: 1000,
+              messages: [{
+                role: "user",
+                content: `You are an expert Bay Area surf coach giving a concise, direct session recommendation. Use real surf lingo.
 
 CURRENT CONDITIONS:
 ${condLines}
@@ -966,21 +993,27 @@ Provide a recommendation covering exactly these 5 points, each on its own paragr
 **Local Tip** — one insider tip that only a regular at that spot would know.
 
 Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
-            }],
-          }),
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          lastErr = json.error?.message || json.message || `HTTP ${res.status}`;
+              }],
+            }),
+          });
+          const json = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            lastErr = json.error?.message || json.message || `HTTP ${res.status}`;
+            continue;
+          }
+          const text = json.content?.find(b => b.type === "text")?.text || "No recommendation available.";
+          setAiRec({ text, loading: false, retryAttempt: attempt, maxAttempts });
+          return;
+        }
+        if (attempt < maxAttempts && isLikelyTransientAiError(lastErr)) {
+          await sleep(750 * attempt);
           continue;
         }
-        const text = json.content?.find(b => b.type === "text")?.text || "No recommendation available.";
-        setAiRec({ text, loading: false });
-        return;
+        break;
       }
-      setAiRec({ text: `AI error: ${lastErr}`, loading: false });
+      setAiRec({ text: `AI error: ${lastErr}`, loading: false, retryAttempt: maxAttempts, maxAttempts });
     } catch {
-      setAiRec({ text: "Could not reach AI. Check your connection and try refreshing.", loading: false });
+      setAiRec({ text: "Could not reach AI. Check your connection and try refreshing.", loading: false, retryAttempt: maxAttempts, maxAttempts });
     }
   };
 
