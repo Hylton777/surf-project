@@ -129,6 +129,65 @@ const isLikelyTransientAiError = msg => {
   );
 };
 
+const normalizeSpotName = name => String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+const createSpotId = name =>
+  `custom_${normalizeSpotName(name).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "spot"}_${Date.now().toString(36)}`;
+
+/** City for sidebar/header: first locality, not state (e.g. "Santa Cruz, CA" → "Santa Cruz"). */
+const deriveCityFromPlaceOrLabel = (placeOrLabel, fallback = "Custom") => {
+  const s = String(placeOrLabel || "").trim();
+  if (!s) return fallback;
+  const parts = s.split(",").map(x => x.trim()).filter(Boolean);
+  if (!parts.length) return fallback;
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1];
+    if (/^[A-Z]{2}$/i.test(last)) return parts[parts.length - 2] || parts[0];
+  }
+  return parts[0];
+};
+
+const VALID_SPOT_DIFFICULTIES = new Set(["Beginner", "Beginner–Inter", "Intermediate", "Expert Only"]);
+
+const normalizeSpotDifficulty = raw => {
+  let s = String(raw || "").trim();
+  if (/^beginner\s*[-–—]\s*inter$/i.test(s)) s = "Beginner–Inter";
+  if (VALID_SPOT_DIFFICULTIES.has(s)) return s;
+  const l = s.toLowerCase();
+  if (l.includes("expert") || l === "expert only") return "Expert Only";
+  if (l.includes("beginner") && (l.includes("inter") || l.includes("mid"))) return "Beginner–Inter";
+  if (l.includes("beginner")) return "Beginner";
+  if (l.includes("intermediate")) return "Intermediate";
+  if (l.includes("advanced")) return "Intermediate";
+  return "Intermediate";
+};
+
+const VALID_BREAK_TYPES = new Set(["Beach Break", "Point Break", "Reef Break", "Unknown Break"]);
+
+const normalizeBreakType = raw => {
+  const s = String(raw || "").trim();
+  if (VALID_BREAK_TYPES.has(s)) return s;
+  const l = s.toLowerCase();
+  if (l.includes("point")) return "Point Break";
+  if (l.includes("reef")) return "Reef Break";
+  if (l.includes("beach")) return "Beach Break";
+  return "Unknown Break";
+};
+
+const getNearestTideStationMeta = (lat, lon) => {
+  const nearest = SPOTS.reduce((best, s) => {
+    const dLat = s.lat - lat;
+    const dLon = s.lon - lon;
+    const score = dLat * dLat + dLon * dLon;
+    if (!best || score < best.score) return { score, spot: s };
+    return best;
+  }, null);
+  return {
+    tideStationId: nearest?.spot?.tideStationId || SPOTS[0].tideStationId,
+    tideStationLabel: nearest?.spot?.tideStationLabel || SPOTS[0].tideStationLabel,
+  };
+};
+
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const fetchMarine = (lat, lon) =>
@@ -173,7 +232,7 @@ const tomTomLabel = (result, fallback = "") =>
     .join(", ") ||
   fallback;
 
-const fetchTomTomLocationOptions = async (query, apiKey) => {
+const fetchTomTomLocationOptions = async (query, apiKey, opts = {}) => {
   const parsed = parseLatLonString(query);
   if (parsed) {
     return [{
@@ -185,7 +244,19 @@ const fetchTomTomLocationOptions = async (query, apiKey) => {
 
   const cleaned = String(query || "").trim();
   if (!cleaned) return [];
-  const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(cleaned)}.json?key=${encodeURIComponent(apiKey)}&limit=8`;
+
+  const limit = opts.limit ?? 8;
+  const params = new URLSearchParams();
+  params.set("key", apiKey);
+  params.set("limit", String(limit));
+  if (opts.countrySet) params.set("countrySet", opts.countrySet);
+  if (opts.biasLat != null && opts.biasLon != null) {
+    params.set("lat", String(opts.biasLat));
+    params.set("lon", String(opts.biasLon));
+  }
+  if (opts.radiusMeters != null) params.set("radius", String(opts.radiusMeters));
+
+  const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(cleaned)}.json?${params.toString()}`;
   try {
     const res = await fetch(url);
     const json = await res.json().catch(() => ({}));
@@ -200,8 +271,73 @@ const fetchTomTomLocationOptions = async (query, apiKey) => {
   }
 };
 
-const resolveTomTomLocation = async (origin, apiKey) => {
-  const options = await fetchTomTomLocationOptions(origin, apiKey);
+/** Parse JSON object with zip + place from Claude response (allows markdown fences). */
+const parseSurfSpotZipPayload = text => {
+  const t = String(text || "").trim();
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const raw = fenced ? fenced[1].trim() : t;
+  const objMatch = raw.match(/\{[\s\S]*\}/);
+  if (!objMatch) return null;
+  try {
+    const j = JSON.parse(objMatch[0]);
+    const digits = String(j.zip ?? "").replace(/\D/g, "");
+    const zip = digits.length >= 5 ? digits.slice(0, 5) : "";
+    if (!/^\d{5}$/.test(zip)) return null;
+    const place = typeof j.place === "string" ? j.place.trim() : "";
+    const difficulty = typeof j.difficulty === "string" ? j.difficulty.trim() : "";
+    const typeRaw = typeof j.type === "string" ? j.type.trim() : (typeof j.breakType === "string" ? j.breakType.trim() : "");
+    return { zip, place, difficulty, type: typeRaw };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Minimal-token lookup: surf spot name → US ZIP + locality hint for TomTom / forecasts.
+ */
+const fetchSurfSpotZipFromAnthropic = async (spotName, regionHint) => {
+  const anthropicUrl = (import.meta.env.VITE_ANTHROPIC_PROXY_URL || "/api/anthropic/messages").trim();
+  const model = (import.meta.env.VITE_ANTHROPIC_SPOT_ZIP_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
+  const res = await fetch(anthropicUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      max_tokens: 180,
+      messages: [{
+        role: "user",
+        content: `Surf break name: "${spotName}"
+User trip context / start area (bias): ${regionHint || "California coast, USA"}
+
+Reply with ONLY valid JSON, no other text:
+{"zip":"95060","place":"Santa Cruz, CA","difficulty":"Intermediate","type":"Point Break"}
+
+Rules:
+- zip: exactly one US 5-digit ZIP for the coastal town/area where that surf break is.
+- place: City name and US state abbreviation only (e.g. "Santa Cruz, CA") — city must be the first segment before the comma.
+- difficulty: exactly one of: Beginner, Beginner–Inter, Intermediate, Expert Only (typical skill needed for that break).
+- type: exactly one of: Beach Break, Point Break, Reef Break.
+
+If impossible, reply exactly: {"zip":"","place":"","difficulty":"","type":""}`,
+      }],
+    }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(json.error?.message || json.message || `HTTP ${res.status}`);
+  }
+  const text = json.content?.find(b => b.type === "text")?.text || "";
+  return parseSurfSpotZipPayload(text);
+};
+
+/** TomTom geocode of US ZIP → lat/lon for marine/wind/routes. */
+const geocodeUsZipWithTomTom = async (zip, apiKey) => {
+  const opts = await fetchTomTomLocationOptions(`${zip}, USA`, apiKey, { countrySet: "US", limit: 5 });
+  return opts[0] || null;
+};
+
+const resolveTomTomLocation = async (origin, apiKey, opts) => {
+  const options = await fetchTomTomLocationOptions(origin, apiKey, opts || {});
   return options[0] || null;
 };
 
@@ -605,7 +741,25 @@ function LoadingScreen({ spotCount }) {
   );
 }
 
-function Dashboard({ spots, spotData, driveTimes, activeSpot, setActiveSpot, tidesByStation, aiRec, skill, quiver, onRefresh }) {
+function Dashboard({
+  spots,
+  spotData,
+  driveTimes,
+  activeSpot,
+  setActiveSpot,
+  tidesByStation,
+  aiRec,
+  skill,
+  quiver,
+  onRefresh,
+  addSpotOpen,
+  setAddSpotOpen,
+  addSpotName,
+  setAddSpotName,
+  addSpotStatus,
+  addSpotLoading,
+  onAddSpot,
+}) {
   const data = spotData[activeSpot.id];
   const spotTides = tidesByStation[activeSpot.tideStationId] || [];
   const rating = data ? getRating(data.waveHeight, data.wavePeriod) : null;
@@ -662,55 +816,149 @@ function Dashboard({ spots, spotData, driveTimes, activeSpot, setActiveSpot, tid
         <div style={{
           width: 188,
           borderRight: `1px solid ${THEME.border}`,
-          overflowY: "auto",
+          display: "flex",
+          flexDirection: "column",
           flexShrink: 0,
           background: "rgba(255,255,255,0.6)",
           backdropFilter: "blur(3px)",
         }}>
-          {spots.map(spot => {
-            const d = spotData[spot.id];
-            const r = d ? getRating(d.waveHeight, d.wavePeriod) : null;
-            const drive = driveTimes[spot.id];
-            const active = spot.id === activeSpot.id;
-            return (
-              <div key={spot.id} onClick={() => setActiveSpot(spot)} style={{
-                padding: "13px 16px", cursor: "pointer",
-                borderBottom: `1px solid ${THEME.border}`,
-                borderLeft: active ? `2px solid ${THEME.accent}` : "2px solid transparent",
-                background: active ? THEME.accentSoft : "transparent",
-                transition: "all 0.1s",
-              }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: active ? THEME.textStrong : THEME.textSoft }}>{spot.shortName}</div>
-                  {r && (
-                    <div style={{
-                      fontSize: 11,
-                      color: getRatingDisplayColor(r.label),
-                      fontFamily: "'Space Mono', monospace",
-                      fontWeight: 700,
-                      letterSpacing: 0.8,
-                      lineHeight: 1,
-                    }}>
-                      {r.label}
-                    </div>
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {spots.map(spot => {
+              const d = spotData[spot.id];
+              const r = d ? getRating(d.waveHeight, d.wavePeriod) : null;
+              const drive = driveTimes[spot.id];
+              const active = spot.id === activeSpot.id;
+              return (
+                <div key={spot.id} onClick={() => setActiveSpot(spot)} style={{
+                  padding: "13px 16px", cursor: "pointer",
+                  borderBottom: `1px solid ${THEME.border}`,
+                  borderLeft: active ? `2px solid ${THEME.accent}` : "2px solid transparent",
+                  background: active ? THEME.accentSoft : "transparent",
+                  transition: "all 0.1s",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: active ? THEME.textStrong : THEME.textSoft }}>{spot.shortName}</div>
+                    {r && (
+                      <div style={{
+                        fontSize: 11,
+                        color: getRatingDisplayColor(r.label),
+                        fontFamily: "'Space Mono', monospace",
+                        fontWeight: 700,
+                        letterSpacing: 0.8,
+                        lineHeight: 1,
+                      }}>
+                        {r.label}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 9, color: THEME.muted, marginBottom: 5 }}>{spot.type} · {spot.city}</div>
+                  {d ? (
+                    <>
+                      <div style={{ fontSize: 11, color: THEME.text, fontFamily: "'Space Mono', monospace" }}>
+                        {fmtFt(d.waveHeight)}ft @ {d.wavePeriod?.toFixed(0)}s
+                      </div>
+                      <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+                        {drive ? `${drive} drive` : "Drive time —"}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 10, color: "#1a2a3a" }}>—</div>
                   )}
                 </div>
-                <div style={{ fontSize: 9, color: THEME.muted, marginBottom: 5 }}>{spot.type} · {spot.city}</div>
-                {d ? (
-                  <>
-                    <div style={{ fontSize: 11, color: THEME.text, fontFamily: "'Space Mono', monospace" }}>
-                      {fmtFt(d.waveHeight)}ft @ {d.wavePeriod?.toFixed(0)}s
-                    </div>
-                    <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
-                      {drive ? `${drive} drive` : "Drive time —"}
-                    </div>
-                  </>
-                ) : (
-                  <div style={{ fontSize: 10, color: "#1a2a3a" }}>—</div>
+              );
+            })}
+          </div>
+          <div style={{ borderTop: `1px solid ${THEME.border}`, padding: 10 }}>
+            {addSpotOpen ? (
+              <div>
+                <input
+                  value={addSpotName}
+                  onChange={e => setAddSpotName(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") onAddSpot();
+                  }}
+                  placeholder="Surf spot (ZIP via Claude, then map)"
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "7px 8px",
+                    borderRadius: 6,
+                    border: `1px solid ${THEME.border}`,
+                    fontSize: 10,
+                    color: THEME.text,
+                    fontFamily: "'Space Mono', monospace",
+                    marginBottom: 6,
+                    background: THEME.panel,
+                  }}
+                />
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={onAddSpot}
+                    disabled={addSpotLoading}
+                    style={{
+                      flex: 1,
+                      padding: "7px 0",
+                      borderRadius: 6,
+                      border: "none",
+                      background: THEME.accent,
+                      color: "#fff",
+                      fontSize: 9,
+                      letterSpacing: 1,
+                      cursor: addSpotLoading ? "default" : "pointer",
+                      fontFamily: "'Space Mono', monospace",
+                      opacity: addSpotLoading ? 0.75 : 1,
+                    }}
+                  >
+                    {addSpotLoading ? "ADDING..." : "ADD"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAddSpotOpen(false);
+                      setAddSpotName("");
+                    }}
+                    disabled={addSpotLoading}
+                    style={{
+                      flex: 1,
+                      padding: "7px 0",
+                      borderRadius: 6,
+                      border: `1px solid ${THEME.border}`,
+                      background: THEME.panel,
+                      color: THEME.textSoft,
+                      fontSize: 9,
+                      letterSpacing: 1,
+                      cursor: addSpotLoading ? "default" : "pointer",
+                      fontFamily: "'Space Mono', monospace",
+                    }}
+                  >
+                    CANCEL
+                  </button>
+                </div>
+                {addSpotStatus && (
+                  <div style={{ fontSize: 9, color: THEME.textSoft, marginTop: 6, lineHeight: 1.35 }}>
+                    {addSpotStatus}
+                  </div>
                 )}
               </div>
-            );
-          })}
+            ) : (
+              <button
+                onClick={() => setAddSpotOpen(true)}
+                style={{
+                  width: "100%",
+                  padding: "8px 0",
+                  borderRadius: 6,
+                  border: `1px dashed ${THEME.accent}`,
+                  background: THEME.accentSoft,
+                  color: THEME.accent,
+                  fontSize: 9,
+                  letterSpacing: 1.2,
+                  cursor: "pointer",
+                  fontFamily: "'Space Mono', monospace",
+                }}
+              >
+                + ADD SPOT
+              </button>
+            )}
+          </div>
         </div>
 
         {/* ── Main panel ── */}
@@ -879,6 +1127,7 @@ export default function App() {
   const [driveOriginOptions, setDriveOriginOptions] = useState([]);
   const [driveOriginOptionsLoading, setDriveOriginOptionsLoading] = useState(false);
   const [showDriveOriginOptions, setShowDriveOriginOptions] = useState(false);
+  const [spots, setSpots] = useState(SPOTS);
   const [spotData, setSpotData] = useState({});
   const [driveTimes, setDriveTimes] = useState({});
   const [spotRetryTick, setSpotRetryTick] = useState(0);
@@ -886,6 +1135,10 @@ export default function App() {
   const [activeSpot, setActiveSpot] = useState(SPOTS[0]);
   const [aiRec, setAiRec] = useState({ text: "", loading: false, retryAttempt: 1, maxAttempts: 1 });
   const [driveRetryTick, setDriveRetryTick] = useState(0);
+  const [addSpotOpen, setAddSpotOpen] = useState(false);
+  const [addSpotName, setAddSpotName] = useState("");
+  const [addSpotStatus, setAddSpotStatus] = useState("");
+  const [addSpotLoading, setAddSpotLoading] = useState(false);
 
   const toggleBoard = id => setQuiver(q => q.includes(id) ? q.filter(x => x !== id) : [...q, id]);
 
@@ -933,7 +1186,7 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [driveOrigin, showDriveOriginOptions, screen]);
 
-  const callAI = async (data, tideData) => {
+  const callAI = async (data, tideData, spotsForAi = spots) => {
     setAiRec({ text: "", loading: true, retryAttempt: 1, maxAttempts: 1 });
 
     const quiverDesc = [
@@ -941,13 +1194,13 @@ export default function App() {
       ...(customBoard.trim() ? [customBoard.trim()] : []),
     ].join(", ") || "unspecified";
 
-    const condLines = SPOTS.map(s => {
+    const condLines = spotsForAi.map(s => {
       const d = data[s.id];
       if (!d) return `${s.name}: no data`;
       return `${s.name} (${s.type}, ${s.difficulty}): ${fmtFt(d.waveHeight)}ft @ ${d.wavePeriod?.toFixed(0)}s, swell ${fmtFt(d.swellHeight)}ft from ${degToCompass(d.swellDir)}, wind ${d.windSpeed?.toFixed(0)}mph from ${degToCompass(d.windDir)}`;
     }).join("\n");
 
-    const tideBlock = SPOTS.map(s => {
+    const tideBlock = spotsForAi.map(s => {
       const preds = tideData?.[s.tideStationId] || [];
       const line = preds.slice(0, 8)
         .map(t => `${t.t}: ${t.type === "H" ? "High" : "Low"} ${parseFloat(t.v).toFixed(1)}ft`)
@@ -1020,28 +1273,28 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
   const loadData = async () => {
     setScreen("loading");
     try {
-      const marines = await Promise.all(SPOTS.map(s => fetchMarine(s.lat, s.lon).catch(() => null)));
+      const marines = await Promise.all(spots.map(s => fetchMarine(s.lat, s.lon).catch(() => null)));
       const winds = await Promise.all(
         marines.map((m, i) => {
-          const lat = m?.latitude ?? SPOTS[i].lat;
-          const lon = m?.longitude ?? SPOTS[i].lon;
+          const lat = m?.latitude ?? spots[i].lat;
+          const lon = m?.longitude ?? spots[i].lon;
           return fetchWind(lat, lon).catch(() => null);
         })
       );
-      const uniqueTideIds = [...new Set(SPOTS.map(s => s.tideStationId))];
+      const uniqueTideIds = [...new Set(spots.map(s => s.tideStationId))];
       const tideJsons = await Promise.all(
         uniqueTideIds.map(id => fetchTides(id).catch(() => ({ predictions: [] })))
       );
       const resolved = driveOriginResolved || await resolveAndAutofillDriveOrigin();
       const originForRouting = resolved ? `${resolved.lat},${resolved.lon}` : driveOrigin;
-      const nextDriveTimes = await fetchDriveTimes(SPOTS, originForRouting);
+      const nextDriveTimes = await fetchDriveTimes(spots, originForRouting);
       const nextTidesByStation = {};
       uniqueTideIds.forEach((id, i) => {
         nextTidesByStation[id] = tideJsons[i]?.predictions || [];
       });
 
       const data = {};
-      SPOTS.forEach((spot, i) => {
+      spots.forEach((spot, i) => {
         data[spot.id] = buildSpotCondition(spot, marines[i], winds[i]);
       });
 
@@ -1051,10 +1304,105 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       setDriveRetryTick(0);
       setTidesByStation(nextTidesByStation);
       setScreen("dashboard");
-      callAI(data, nextTidesByStation);
+      callAI(data, nextTidesByStation, spots);
     } catch (err) {
       console.error(err);
       setScreen("dashboard");
+    }
+  };
+
+  const handleAddSpot = async () => {
+    const name = addSpotName.trim();
+    if (!name) {
+      setAddSpotStatus("Enter a spot name.");
+      return;
+    }
+    const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+    if (!apiKey) {
+      setAddSpotStatus("TomTom API key is missing. Add VITE_TOMTOM_API_KEY to map the ZIP to coordinates.");
+      return;
+    }
+
+    setAddSpotLoading(true);
+    setAddSpotStatus("Looking up ZIP (Claude)…");
+    try {
+      const regionHint = (driveOrigin.trim() || "San Francisco Bay Area, California, USA");
+      const zipPayload = await fetchSurfSpotZipFromAnthropic(name, regionHint);
+      if (!zipPayload?.zip) {
+        setAddSpotStatus("Could not get a US ZIP for that spot. Try a more specific name (e.g. “Steamer Lane, Santa Cruz”).");
+        return;
+      }
+
+      setAddSpotStatus(`ZIP ${zipPayload.zip} — mapping…`);
+      const resolved = await geocodeUsZipWithTomTom(zipPayload.zip, apiKey);
+      if (!resolved) {
+        setAddSpotStatus(`Could not geocode ZIP ${zipPayload.zip}. Check your TomTom key.`);
+        return;
+      }
+
+      const dupByName = spots.some(s =>
+        normalizeSpotName(s.name) === normalizeSpotName(name)
+      );
+      const dupByCoords = spots.some(s =>
+        Math.abs((s.lat || 0) - resolved.lat) < 0.01 && Math.abs((s.lon || 0) - resolved.lon) < 0.01
+      );
+      if (dupByName || dupByCoords) {
+        setAddSpotStatus("That spot already exists in your list.");
+        return;
+      }
+
+      const cityDisplay = zipPayload.place
+        ? deriveCityFromPlaceOrLabel(zipPayload.place)
+        : deriveCityFromPlaceOrLabel(resolved.label);
+      const tideMeta = getNearestTideStationMeta(resolved.lat, resolved.lon);
+      const nextSpot = {
+        id: createSpotId(name),
+        name,
+        shortName: name.length > 18 ? `${name.slice(0, 18)}…` : name,
+        lat: resolved.lat,
+        lon: resolved.lon,
+        type: normalizeBreakType(zipPayload.type),
+        difficulty: normalizeSpotDifficulty(zipPayload.difficulty),
+        city: cityDisplay,
+        tideStationId: tideMeta.tideStationId,
+        tideStationLabel: tideMeta.tideStationLabel,
+      };
+      const nextSpots = [...spots, nextSpot];
+
+      setSpots(nextSpots);
+      setActiveSpot(nextSpot);
+      setAddSpotStatus(`Added ${nextSpot.name}. Fetching conditions...`);
+
+      const condition = await fetchSpotCondition(nextSpot);
+      if (condition) {
+        setSpotData(prev => ({ ...prev, [nextSpot.id]: condition }));
+      }
+
+      const originForRouting = driveOriginResolved
+        ? `${driveOriginResolved.lat},${driveOriginResolved.lon}`
+        : driveOrigin;
+      const drive = await fetchDriveTimes([nextSpot], originForRouting);
+      if (drive?.[nextSpot.id]) {
+        setDriveTimes(prev => ({ ...prev, [nextSpot.id]: drive[nextSpot.id] }));
+      }
+
+      if (!tidesByStation[nextSpot.tideStationId]) {
+        const tideJson = await fetchTides(nextSpot.tideStationId).catch(() => ({ predictions: [] }));
+        setTidesByStation(prev => ({
+          ...prev,
+          [nextSpot.tideStationId]: tideJson?.predictions || [],
+        }));
+      }
+
+      setAddSpotName("");
+      setAddSpotOpen(false);
+      setAddSpotStatus("");
+      setSpotRetryTick(0);
+      setDriveRetryTick(0);
+    } catch (err) {
+      setAddSpotStatus(err?.message || "Failed to add spot. Check Anthropic proxy and try again.");
+    } finally {
+      setAddSpotLoading(false);
     }
   };
 
@@ -1062,7 +1410,7 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     if (screen !== "dashboard") return;
     const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
     if (!apiKey) return;
-    const unresolvedCount = SPOTS.filter(s => !driveTimes[s.id]).length;
+    const unresolvedCount = spots.filter(s => !driveTimes[s.id]).length;
     if (unresolvedCount === 0) return;
     if (driveRetryTick >= 6) return; // Stop after ~1 minute of retries.
 
@@ -1070,7 +1418,7 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       const originForRetry = driveOriginResolved
         ? `${driveOriginResolved.lat},${driveOriginResolved.lon}`
         : driveOrigin;
-      const recovered = await fetchMissingDriveTimes(SPOTS, driveTimes, originForRetry);
+      const recovered = await fetchMissingDriveTimes(spots, driveTimes, originForRetry);
       if (Object.keys(recovered).length) {
         setDriveTimes(prev => ({ ...prev, ...recovered }));
       }
@@ -1078,16 +1426,16 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     }, 10000);
 
     return () => clearTimeout(timer);
-  }, [screen, driveTimes, driveRetryTick, driveOrigin, driveOriginResolved]);
+  }, [screen, driveTimes, driveRetryTick, driveOrigin, driveOriginResolved, spots]);
 
   useEffect(() => {
     if (screen !== "dashboard") return;
-    const unresolvedCount = SPOTS.filter(s => !spotData[s.id]).length;
+    const unresolvedCount = spots.filter(s => !spotData[s.id]).length;
     if (unresolvedCount === 0) return;
     if (spotRetryTick >= 6) return; // Stop after ~1 minute of retries.
 
     const timer = setTimeout(async () => {
-      const recovered = await fetchMissingSpotData(SPOTS, spotData);
+      const recovered = await fetchMissingSpotData(spots, spotData);
       if (Object.keys(recovered).length) {
         setSpotData(prev => ({ ...prev, ...recovered }));
       }
@@ -1095,7 +1443,12 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     }, 10000);
 
     return () => clearTimeout(timer);
-  }, [screen, spotData, spotRetryTick]);
+  }, [screen, spotData, spotRetryTick, spots]);
+
+  useEffect(() => {
+    if (!activeSpot || spots.some(s => s.id === activeSpot.id)) return;
+    setActiveSpot(spots[0]);
+  }, [spots, activeSpot]);
 
   if (screen === "setup") return (
     <SetupScreen skill={skill} setSkill={setSkill} quiver={quiver}
@@ -1119,11 +1472,18 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       }}
       onSubmit={loadData} />
   );
-  if (screen === "loading") return <LoadingScreen spotCount={SPOTS.length} />;
+  if (screen === "loading") return <LoadingScreen spotCount={spots.length} />;
 
   return (
-    <Dashboard spots={SPOTS} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
+    <Dashboard spots={spots} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
       setActiveSpot={setActiveSpot} tidesByStation={tidesByStation} aiRec={aiRec}
-      skill={skill} quiver={quiver} onRefresh={() => callAI(spotData, tidesByStation)} />
+      skill={skill} quiver={quiver} onRefresh={() => callAI(spotData, tidesByStation, spots)}
+      addSpotOpen={addSpotOpen} setAddSpotOpen={setAddSpotOpen}
+      addSpotName={addSpotName} setAddSpotName={value => {
+        setAddSpotName(value);
+        setAddSpotStatus("");
+      }}
+      addSpotStatus={addSpotStatus} addSpotLoading={addSpotLoading}
+      onAddSpot={handleAddSpot} />
   );
 }
