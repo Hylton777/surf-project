@@ -61,6 +61,22 @@ const mToFt = m => m * 3.28084;
 const fmtFt = (m, d = 1) => mToFt(m).toFixed(d);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+/** Vite dev: `/api/anthropic/messages`. Standalone proxy: `origin` + `/v1/messages`. */
+const getAnthropicMessagesUrl = () => {
+  const raw = (import.meta.env.VITE_ANTHROPIC_PROXY_URL || "").trim();
+  if (!raw) return "/api/anthropic/messages";
+  if (!/^https?:\/\//i.test(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    let p = (u.pathname || "/").replace(/\/+$/, "");
+    if (!p || p === "/") p = "/v1/messages";
+    u.pathname = p;
+    return u.toString();
+  } catch {
+    return raw;
+  }
+};
+
 const degToCompass = deg => {
   const dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
   return dirs[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
@@ -296,7 +312,7 @@ const parseSurfSpotZipPayload = text => {
  * Minimal-token lookup: surf spot name → US ZIP + locality hint for TomTom / forecasts.
  */
 const fetchSurfSpotZipFromAnthropic = async (spotName, regionHint) => {
-  const anthropicUrl = (import.meta.env.VITE_ANTHROPIC_PROXY_URL || "/api/anthropic/messages").trim();
+  const anthropicUrl = getAnthropicMessagesUrl();
   const model = (import.meta.env.VITE_ANTHROPIC_SPOT_ZIP_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
   const res = await fetch(anthropicUrl, {
     method: "POST",
@@ -1208,7 +1224,7 @@ export default function App() {
       return `${s.name} — NOAA ${s.tideStationId} (${s.tideStationLabel}): ${line || "no predictions"}`;
     }).join("\n");
 
-    const anthropicUrl = (import.meta.env.VITE_ANTHROPIC_PROXY_URL || "/api/anthropic/messages").trim();
+    const anthropicUrl = getAnthropicMessagesUrl();
     const primaryModel = (import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
     const fallbackModel = (import.meta.env.VITE_ANTHROPIC_FALLBACK_MODEL || "claude-sonnet-4-6").trim();
     const modelChain = [...new Set([primaryModel, fallbackModel].filter(Boolean))];

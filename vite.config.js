@@ -61,8 +61,13 @@ export default defineConfig(({ mode }) => {
     .trim()
     .split(/[\s,]+/)
     .filter(Boolean);
+  const fallbackPublic = ["8.8.8.8", "1.1.1.1"];
   if (dnsServers.length) {
     dns.setServers(dnsServers);
+  } else {
+    const current = dns.getServers().filter(Boolean);
+    const merged = [...current, ...fallbackPublic.filter(ip => !current.includes(ip))];
+    if (merged.length) dns.setServers(merged);
   }
 
   return {

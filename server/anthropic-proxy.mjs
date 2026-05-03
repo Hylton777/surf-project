@@ -5,12 +5,27 @@
  * Usage: ANTHROPIC_API_KEY=sk-ant-... node server/anthropic-proxy.mjs
  * Default listen: http://127.0.0.1:8787
  *
- * Then: VITE_ANTHROPIC_PROXY_URL=http://127.0.0.1:8787 npm run preview
+ * Then: VITE_ANTHROPIC_PROXY_URL=http://127.0.0.1:8787/v1/messages npm run preview
+ * (or omit the path — the app normalizes bare origins to /v1/messages.)
  */
 import http from "node:http";
+import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+dns.setDefaultResultOrder("ipv4first");
+{
+  const fromEnv = (process.env.ANTHROPIC_DNS_SERVERS || "").trim().split(/[\s,]+/).filter(Boolean);
+  const fallbackPublic = ["8.8.8.8", "1.1.1.1"];
+  if (fromEnv.length) {
+    dns.setServers(fromEnv);
+  } else {
+    const current = dns.getServers().filter(Boolean);
+    const merged = [...current, ...fallbackPublic.filter(ip => !current.includes(ip))];
+    if (merged.length) dns.setServers(merged);
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, "..");
