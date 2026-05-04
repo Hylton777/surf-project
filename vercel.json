@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/anthropic/messages.js": {
+      "maxDuration": 60
+    }
+  }
+}

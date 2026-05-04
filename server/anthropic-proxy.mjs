@@ -13,6 +13,7 @@ import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { fetchAnthropicWithRetry } from "./anthropic-upstream.mjs";
 
 dns.setDefaultResultOrder("ipv4first");
 {
@@ -74,15 +75,19 @@ const server = http.createServer(async (req, res) => {
   const body = Buffer.concat(chunks).toString("utf8");
 
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
+    const r = await fetchAnthropicWithRetry(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body,
       },
-      body,
-    });
+      3
+    );
     const buf = Buffer.from(await r.arrayBuffer());
     res.writeHead(r.status, { "Content-Type": r.headers.get("content-type") || "application/json" });
     res.end(buf);
