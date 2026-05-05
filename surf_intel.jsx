@@ -966,9 +966,10 @@ function Dashboard({
   setActiveSpot,
   tidesByStation,
   aiRec,
+  aiCalled,
   skill,
   quiver,
-  onRefresh,
+  onGenerateAi,
   addSpotOpen,
   setAddSpotOpen,
   addSpotName,
@@ -1019,11 +1020,6 @@ function Dashboard({
         <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
           <span style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace" }}>{dateStr} · {timeStr}</span>
           <span style={{ fontSize: 10, color: THEME.textSoft }}>{skill} · {quiver.length} boards</span>
-          <button onClick={onRefresh} style={{
-            padding: "5px 13px", background: THEME.panel, border: `1px solid ${THEME.border}`,
-            borderRadius: 4, color: THEME.text, fontSize: 10, cursor: "pointer",
-            fontFamily: "'Space Mono', monospace", letterSpacing: 1, transition: "all 0.15s",
-          }}>↻ REFRESH AI</button>
         </div>
       </div>
 
@@ -1279,14 +1275,40 @@ function Dashboard({
               ))}
               <style>{`@keyframes shimmer{0%,100%{opacity:0.4}50%{opacity:1}}`}</style>
             </div>
-          ) : aiRec.text ? (
-            <div
-              style={{ fontSize: 12.5, lineHeight: 1.75, color: THEME.text }}
-              dangerouslySetInnerHTML={{ __html: `<p style='margin:0'>${formatAI(aiRec.text)}</p>` }}
-            />
+          ) : aiCalled ? (
+            aiRec.text ? (
+              <div
+                style={{ fontSize: 12.5, lineHeight: 1.75, color: THEME.text }}
+                dangerouslySetInnerHTML={{ __html: `<p style='margin:0'>${formatAI(aiRec.text)}</p>` }}
+              />
+            ) : (
+              <div style={{ fontSize: 12, color: THEME.textSoft }}>
+                AI recommendation unavailable.
+              </div>
+            )
           ) : (
-            <div style={{ fontSize: 12, color: THEME.textSoft }}>
-              Fetch conditions to get your AI recommendation.
+            <div>
+              <div style={{ fontSize: 12, color: THEME.textSoft, marginBottom: 14, lineHeight: 1.55 }}>
+                Tap below to use Claude on the current conditions. You only get one AI call per session, so make it count.
+              </div>
+              <button
+                onClick={onGenerateAi}
+                style={{
+                  width: "100%",
+                  padding: "11px 0",
+                  background: THEME.accent,
+                  border: "none",
+                  borderRadius: 6,
+                  color: "#ffffff",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: 2,
+                  cursor: "pointer",
+                  fontFamily: "'Space Mono', monospace",
+                }}
+              >
+                GENERATE AI RECOMMENDATION
+              </button>
             </div>
           )}
 
@@ -1351,6 +1373,7 @@ export default function App() {
   const [tidesByStation, setTidesByStation] = useState({});
   const [activeSpot, setActiveSpot] = useState(SPOTS[0]);
   const [aiRec, setAiRec] = useState({ text: "", loading: false, retryAttempt: 1, maxAttempts: 1 });
+  const [aiCalled, setAiCalled] = useState(false);
   const [driveRetryTick, setDriveRetryTick] = useState(0);
   const [addSpotOpen, setAddSpotOpen] = useState(false);
   const [addSpotName, setAddSpotName] = useState("");
@@ -1521,7 +1544,6 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       setDriveRetryTick(0);
       setTidesByStation(nextTidesByStation);
       setScreen("dashboard");
-      callAI(data, nextTidesByStation, spots);
     } catch (err) {
       console.error(err);
       setScreen("dashboard");
@@ -1694,7 +1716,13 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
   return (
     <Dashboard spots={spots} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
       setActiveSpot={setActiveSpot} tidesByStation={tidesByStation} aiRec={aiRec}
-      skill={skill} quiver={quiver} onRefresh={() => callAI(spotData, tidesByStation, spots)}
+      aiCalled={aiCalled}
+      skill={skill} quiver={quiver}
+      onGenerateAi={() => {
+        if (aiCalled || aiRec.loading) return;
+        setAiCalled(true);
+        callAI(spotData, tidesByStation, spots);
+      }}
       addSpotOpen={addSpotOpen} setAddSpotOpen={setAddSpotOpen}
       addSpotName={addSpotName} setAddSpotName={value => {
         setAddSpotName(value);
