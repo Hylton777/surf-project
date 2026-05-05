@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from "react";
+import { SPOT_CONFIGS } from "./surfSpotConfigs";
+import { computeSurfScore } from "./src/surfScorer";
 
 // ─── Data ───────────────────────────────────────────────────────────────────
 
@@ -8,7 +10,9 @@ const SPOTS = [
   { id: "ob", name: "Ocean Beach", shortName: "OB", lat: 37.7594, lon: -122.5107, type: "Beach Break", difficulty: "Intermediate", city: "San Francisco", tideStationId: "9414290", tideStationLabel: "San Francisco (Golden Gate)" },
   { id: "linda_mar", name: "Linda Mar", shortName: "Linda Mar", lat: 37.5841, lon: -122.4994, type: "Beach Break", difficulty: "Beginner–Inter", city: "Pacifica", tideStationId: "9414290", tideStationLabel: "San Francisco (Golden Gate)" },
   { id: "bolinas", name: "Bolinas", shortName: "Bolinas", lat: 37.9074, lon: -122.7174, type: "Point Break", difficulty: "Intermediate", city: "Marin", tideStationId: "9414958", tideStationLabel: "Bolinas Lagoon" },
-  { id: "stinson", name: "Stinson Beach", shortName: "Stinson", lat: 37.8996, lon: -122.6416, type: "Beach Break", difficulty: "Beginner", city: "Marin", tideStationId: "9415020", tideStationLabel: "Point Reyes" },
+  { id: "steamer_lane", name: "Steamer Lane", shortName: "Steamer Lane", lat: 36.9514, lon: -122.0267, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
+  { id: "montara", name: "Montara", shortName: "Montara", lat: 37.5396, lon: -122.5167, type: "Beach Break", difficulty: "Intermediate", city: "Montara", tideStationId: "9414131", tideStationLabel: "Pillar Point Harbor" },
+  { id: "hmb_surfers_beach", name: "Half Moon Bay (Surfers' Beach)", shortName: "Surfers' Beach", lat: 37.5038, lon: -122.4837, type: "Beach Break", difficulty: "Beginner–Inter", city: "Half Moon Bay", tideStationId: "9414131", tideStationLabel: "Pillar Point Harbor" },
   { id: "mavs", name: "Mavericks", shortName: "Mavs", lat: 37.4953, lon: -122.5003, type: "Reef Break", difficulty: "Expert Only", city: "Half Moon Bay", tideStationId: "9414131", tideStationLabel: "Pillar Point Harbor" },
   { id: "pleasure_point", name: "Pleasure Point", shortName: "Pleasure Point", lat: 36.9569, lon: -121.9817, type: "Point Break", difficulty: "Intermediate", city: "Santa Cruz", tideStationId: "9413745", tideStationLabel: "Santa Cruz, Monterey Bay" },
 ];
@@ -103,28 +107,14 @@ const alignHourIdx = (primaryTimes, secondaryTimes, hi) => {
   return j !== -1 ? j : Math.min(Math.max(0, hi), secondaryTimes.length - 1);
 };
 
-const getRating = (heightM, periodS) => {
-  const ft = mToFt(heightM);
-  if (ft < 1)  return { label: "FLAT",    color: "#3a5570" };
-  if (ft < 2.5) return { label: "SMALL",   color: "#5a7a9a" };
-  if (ft < 4 && periodS >= 10) return { label: "FUN",  color: "#0eb8a0" };
-  if (ft < 4)  return { label: "WEAK",    color: "#7a9aaa" };
-  if (ft < 7 && periodS >= 12) return { label: "EPIC", color: "#ff8c42" };
-  if (ft < 7)  return { label: "SOLID",   color: "#0eb8a0" };
-  if (ft < 12) return { label: "PUMPING", color: "#e84545" };
-  return       { label: "MAXING",  color: "#c0392b" };
-};
-
 const getRatingDisplayColor = label => {
   const map = {
-    FLAT: "#d73027",
-    SMALL: "#f46d43",
-    WEAK: "#fdae61",
-    FUN: "#66bd63",
-    SOLID: "#1a9850",
-    EPIC: "#1a9850",
-    PUMPING: "#0b7d3e",
-    MAXING: "#0a5f30",
+    Pumping: "#14532d",
+    Good: "#16a34a",
+    Decent: "#f59e0b",
+    Bad: "#f97316",
+    Poor: "#dc2626",
+    Dormant: "#000000",
   };
   return map[label] || THEME.textSoft;
 };
@@ -189,6 +179,68 @@ const normalizeBreakType = raw => {
   if (l.includes("reef")) return "Reef Break";
   if (l.includes("beach")) return "Beach Break";
   return "Unknown Break";
+};
+
+const MPH_TO_KNOTS = 0.868976;
+
+const LEGACY_SPOT_CONFIG_ID = {
+  ob: "ocean_beach_sf",
+  linda_mar: "linda_mar",
+  bolinas: "bolinas",
+  steamer_lane: "steamer_lane",
+  montara: "montara",
+  hmb_surfers_beach: "half_moon_bay_surfers_beach",
+  mavs: "mavericks",
+  pleasure_point: "pleasure_point",
+};
+
+const SPOT_CONFIG_BY_ID = SPOT_CONFIGS.reduce((acc, cfg) => {
+  acc[cfg.id] = cfg;
+  return acc;
+}, {});
+
+const getNearestTideValue = tides => {
+  if (!Array.isArray(tides) || !tides.length) return null;
+  const nowMs = Date.now();
+  let best = null;
+  for (const t of tides) {
+    const ts = new Date(t?.t).getTime();
+    const v = Number(t?.v);
+    if (!Number.isFinite(ts) || !Number.isFinite(v)) continue;
+    const delta = Math.abs(ts - nowMs);
+    if (!best || delta < best.delta) best = { delta, value: v };
+  }
+  return best ? best.value : null;
+};
+
+const parseDriveTimeMinutes = drive => {
+  if (!drive || typeof drive !== "string") return Number.POSITIVE_INFINITY;
+  const text = drive.toLowerCase();
+  const hrMatch = text.match(/(\d+)\s*hr/);
+  const minMatch = text.match(/(\d+)\s*min/);
+  const hrs = hrMatch ? Number(hrMatch[1]) : 0;
+  const mins = minMatch ? Number(minMatch[1]) : 0;
+  const total = hrs * 60 + mins;
+  return total > 0 ? total : Number.POSITIVE_INFINITY;
+};
+
+const computeDisplayScore = (spot, d, tidesByStation) => {
+  if (!spot || !d) return null;
+  const configId = LEGACY_SPOT_CONFIG_ID[spot.id];
+  const spotConfig = configId ? SPOT_CONFIG_BY_ID[configId] : null;
+  if (!spotConfig) return null;
+
+  const swellHeightM = Number.isFinite(d.swellHeight) && d.swellHeight > 0 ? d.swellHeight : d.waveHeight;
+  const conditions = {
+    // Existing app data is in meters; scorer expects feet.
+    swellHeight: Number.isFinite(swellHeightM) ? mToFt(swellHeightM) : 0,
+    swellPeriod: Number.isFinite(d.swellPeriod) && d.swellPeriod > 0 ? d.swellPeriod : d.wavePeriod,
+    swellDirection: Number.isFinite(d.swellDir) ? d.swellDir : d.waveDir,
+    windSpeed: (Number(d.windSpeed) || 0) * MPH_TO_KNOTS,
+    windDirection: Number(d.windDir) || 0,
+    tide: getNearestTideValue(tidesByStation?.[spot.tideStationId]),
+  };
+  return computeSurfScore(conditions, spotConfig);
 };
 
 const getNearestTideStationMeta = (lat, lon) => {
@@ -1276,7 +1328,16 @@ function Dashboard({
   const [syncMs, setSyncMs] = useState(null);
   const data = spotData[activeSpot.id];
   const spotTides = tidesByStation[activeSpot.tideStationId] || [];
-  const rating = data ? getRating(data.waveHeight, data.wavePeriod) : null;
+  const activeSpotScore = computeDisplayScore(activeSpot, data, tidesByStation);
+  const sortedSpots = [...spots].sort((a, b) => {
+    const aScore = computeDisplayScore(a, spotData[a.id], tidesByStation)?.score ?? -1;
+    const bScore = computeDisplayScore(b, spotData[b.id], tidesByStation)?.score ?? -1;
+    if (bScore !== aScore) return bScore - aScore;
+    const aDrive = parseDriveTimeMinutes(driveTimes[a.id]);
+    const bDrive = parseDriveTimeMinutes(driveTimes[b.id]);
+    if (aDrive !== bDrive) return aDrive - bDrive;
+    return a.shortName.localeCompare(b.shortName);
+  });
 
   const formatAI = text =>
     text.replace(/\*\*(.*?)\*\*/g, `<strong style="color:${THEME.accent}">$1</strong>`)
@@ -1332,9 +1393,9 @@ function Dashboard({
           backdropFilter: "blur(3px)",
         }}>
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {spots.map(spot => {
+            {sortedSpots.map(spot => {
               const d = spotData[spot.id];
-              const r = d ? getRating(d.waveHeight, d.wavePeriod) : null;
+              const scoreResult = computeDisplayScore(spot, d, tidesByStation);
               const drive = driveTimes[spot.id];
               const active = spot.id === activeSpot.id;
               return (
@@ -1347,19 +1408,12 @@ function Dashboard({
                 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: active ? THEME.textStrong : THEME.textSoft }}>{spot.shortName}</div>
-                    {r && (
-                      <div style={{
-                        fontSize: 11,
-                        color: getRatingDisplayColor(r.label),
-                        fontFamily: "'Space Mono', monospace",
-                        fontWeight: 700,
-                        letterSpacing: 0.8,
-                        lineHeight: 1,
-                      }}>
-                        {r.label}
-                      </div>
-                    )}
                   </div>
+                  {scoreResult && (
+                    <div style={{ fontSize: 10, color: getRatingDisplayColor(scoreResult.rating), fontFamily: "'Space Mono', monospace", fontWeight: 700, marginBottom: 4 }}>
+                      {scoreResult.score}/100 · {scoreResult.rating}
+                    </div>
+                  )}
                   <div style={{ fontSize: 9, color: THEME.muted, marginBottom: 5 }}>{spot.type} · {spot.city}</div>
                   {d ? (
                     <>
@@ -1489,11 +1543,21 @@ function Dashboard({
                   <h2 style={{ fontFamily: "'Playfair Display', serif", fontSize: 30, margin: 0, color: THEME.textStrong }}>
                     {activeSpot.name}
                   </h2>
-                  <div style={{
-                    fontSize: 10, color: rating?.color, fontFamily: "'Space Mono', monospace",
-                    fontWeight: 700, letterSpacing: 3, border: `1px solid ${rating?.color}20`,
-                    padding: "4px 12px", borderRadius: 3, background: `${rating?.color}10`,
-                  }}>{rating?.label}</div>
+                  {activeSpotScore && (
+                    <div style={{
+                      fontSize: 10,
+                      color: getRatingDisplayColor(activeSpotScore.rating),
+                      fontFamily: "'Space Mono', monospace",
+                      fontWeight: 700,
+                      letterSpacing: 1.5,
+                      border: `1px solid ${getRatingDisplayColor(activeSpotScore.rating)}30`,
+                      padding: "4px 10px",
+                      borderRadius: 3,
+                      background: `${getRatingDisplayColor(activeSpotScore.rating)}12`,
+                    }}>
+                      SCORE {activeSpotScore.score}/100 · {activeSpotScore.rating.toUpperCase()}
+                    </div>
+                  )}
                   <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", letterSpacing: 1.5 }}>
                     {driveTimes[activeSpot.id] ? `${driveTimes[activeSpot.id]} DRIVE` : "DRIVE TIME —"}
                   </div>
@@ -1629,11 +1693,11 @@ function Dashboard({
           <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${THEME.border}` }}>
             <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.textSoft, marginBottom: 12 }}>CONDITION KEY</div>
             {[
-              { label: "EPIC", color: "#ff8c42", desc: "Long period, overhead+" },
-              { label: "SOLID", color: "#0eb8a0", desc: "Clean, fun-sized surf" },
-              { label: "FUN",  color: "#0eb8a0", desc: "Waist–chest high, clean" },
-              { label: "WEAK", color: "#5a7a9a", desc: "Mushy, short period" },
-              { label: "SMALL", color: "#3a5570", desc: "Knee high or less" },
+              { label: "Pumping", color: getRatingDisplayColor("Pumping"), desc: "Powerful, high-quality surf" },
+              { label: "Good", color: getRatingDisplayColor("Good"), desc: "Consistently quality waves" },
+              { label: "Decent", color: getRatingDisplayColor("Decent"), desc: "Rideable with some tradeoffs" },
+              { label: "Bad", color: getRatingDisplayColor("Bad"), desc: "Marginal and inconsistent" },
+              { label: "Poor", color: getRatingDisplayColor("Poor"), desc: "Unfavorable surf conditions" },
             ].map(r => (
               <div key={r.label} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7 }}>
                 <span style={{ fontSize: 8, color: r.color, fontFamily: "'Space Mono', monospace", fontWeight: 700, minWidth: 46 }}>{r.label}</span>
