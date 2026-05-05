@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { SPOT_CONFIGS } from "./surfSpotConfigs";
+import { DEFAULT_WEIGHTS, SPOT_CONFIGS } from "./surfSpotConfigs";
 import { computeSurfScore } from "./src/surfScorer";
 
 // ─── Data ───────────────────────────────────────────────────────────────────
@@ -224,10 +224,166 @@ const parseDriveTimeMinutes = drive => {
   return total > 0 ? total : Number.POSITIVE_INFINITY;
 };
 
+const normalizeConfidence = value => {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "high" || v === "medium" || v === "low") return v;
+  return "medium";
+};
+
+const normalizeBreakTypeKey = value => {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "reef_point" || v === "reef point") return "reef_point";
+  if (v === "point") return "point";
+  if (v === "reef") return "reef";
+  return "beach";
+};
+
+const normalizeDifficultyKey = value => {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "expert") return "expert";
+  if (v === "advanced") return "advanced";
+  if (v === "intermediate") return "intermediate";
+  return "beginner";
+};
+
+const breakTypeKeyToDisplay = key => {
+  const map = {
+    beach: "Beach Break",
+    reef: "Reef Break",
+    point: "Point Break",
+    reef_point: "Reef Break",
+  };
+  return map[key] || "Beach Break";
+};
+
+const difficultyKeyToDisplay = key => {
+  const map = {
+    beginner: "Beginner",
+    intermediate: "Intermediate",
+    advanced: "Intermediate",
+    expert: "Expert Only",
+  };
+  return map[key] || "Intermediate";
+};
+
+const normalizeWeightsToUnitSum = rawWeights => {
+  const candidate = { ...DEFAULT_WEIGHTS, ...(rawWeights || {}) };
+  const weights = {
+    height: Number(candidate.height) || 0,
+    period: Number(candidate.period) || 0,
+    direction: Number(candidate.direction) || 0,
+    wind: Number(candidate.wind) || 0,
+    tide: Number(candidate.tide) || 0,
+  };
+  let total = weights.height + weights.period + weights.direction + weights.wind + weights.tide;
+  if (total <= 0) return { ...DEFAULT_WEIGHTS };
+
+  const normalized = {
+    height: weights.height / total,
+    period: weights.period / total,
+    direction: weights.direction / total,
+    wind: weights.wind / total,
+    tide: weights.tide / total,
+  };
+
+  // Keep a stable 1.0 sum even after rounding in JSON/stringify/display.
+  const rounded = {
+    height: Number(normalized.height.toFixed(4)),
+    period: Number(normalized.period.toFixed(4)),
+    direction: Number(normalized.direction.toFixed(4)),
+    wind: Number(normalized.wind.toFixed(4)),
+    tide: Number(normalized.tide.toFixed(4)),
+  };
+  const roundedSum = rounded.height + rounded.period + rounded.direction + rounded.wind + rounded.tide;
+  rounded.tide = Number((rounded.tide + (1 - roundedSum)).toFixed(4));
+  return rounded;
+};
+
+const parseJsonObjectFromText = text => {
+  const t = String(text || "").trim();
+  if (!t) return null;
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const raw = fenced ? fenced[1].trim() : t;
+  const objMatch = raw.match(/\{[\s\S]*\}/);
+  if (!objMatch) return null;
+  try {
+    return JSON.parse(objMatch[0]);
+  } catch {
+    return null;
+  }
+};
+
+const toSlug = value =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const normalizeGeneratedSpotConfig = (cfg, fallbackName) => {
+  if (!cfg || typeof cfg !== "object") return null;
+
+  const name = String(cfg.name || fallbackName || "").trim();
+  if (!name) return null;
+
+  const latitude = Number(cfg.latitude);
+  const longitude = Number(cfg.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+
+  const dirs = Array.isArray(cfg.optimal_swell_directions)
+    ? cfg.optimal_swell_directions.map(Number).filter(Number.isFinite).slice(0, 3)
+    : [];
+  if (!dirs.length) return null;
+
+  const tideRangeRaw = Array.isArray(cfg.optimal_tide_range_ft) ? cfg.optimal_tide_range_ft : [];
+  const tideRange = [Number(tideRangeRaw[0]), Number(tideRangeRaw[1])];
+  if (!Number.isFinite(tideRange[0]) || !Number.isFinite(tideRange[1])) return null;
+  const normalizedTideRange = tideRange[0] <= tideRange[1] ? tideRange : [tideRange[1], tideRange[0]];
+
+  const normalized = {
+    id: toSlug(cfg.id || name) || toSlug(fallbackName) || "custom_spot",
+    name,
+    region: String(cfg.region || "").trim() || deriveCityFromPlaceOrLabel(name, "Custom"),
+    latitude,
+    longitude,
+    break_type: normalizeBreakTypeKey(cfg.break_type),
+    difficulty: normalizeDifficultyKey(cfg.difficulty),
+    break_facing_direction: ((Number(cfg.break_facing_direction) || 0) % 360 + 360) % 360,
+    optimal_swell_directions: dirs.map(d => ((d % 360) + 360) % 360),
+    swell_direction_tolerance: Math.max(10, Math.min(60, Number(cfg.swell_direction_tolerance) || 30)),
+    min_rideable_ft: Math.max(0.5, Number(cfg.min_rideable_ft) || 1),
+    optimal_height_min_ft: Math.max(0.5, Number(cfg.optimal_height_min_ft) || 2),
+    optimal_height_max_ft: Math.max(0.5, Number(cfg.optimal_height_max_ft) || 4),
+    max_rideable_ft: Math.max(1, Number(cfg.max_rideable_ft) || 8),
+    min_period_s: Math.max(5, Number(cfg.min_period_s) || 8),
+    optimal_tide_range_ft: normalizedTideRange,
+    tide_preference: ["low", "mid", "high", "any"].includes(String(cfg.tide_preference || "").trim().toLowerCase())
+      ? String(cfg.tide_preference).trim().toLowerCase()
+      : "mid",
+    noaa_tide_station_id: cfg.noaa_tide_station_id == null ? null : String(cfg.noaa_tide_station_id).trim(),
+    weights: normalizeWeightsToUnitSum(cfg.weights),
+    notes: String(cfg.notes || "").trim() || "User-added surf break configuration.",
+    isUserAdded: true,
+    confidence: normalizeConfidence(cfg.confidence),
+  };
+
+  if (normalized.optimal_height_min_ft < normalized.min_rideable_ft) {
+    normalized.optimal_height_min_ft = normalized.min_rideable_ft;
+  }
+  if (normalized.optimal_height_max_ft < normalized.optimal_height_min_ft) {
+    normalized.optimal_height_max_ft = normalized.optimal_height_min_ft;
+  }
+  if (normalized.max_rideable_ft < normalized.optimal_height_max_ft) {
+    normalized.max_rideable_ft = normalized.optimal_height_max_ft;
+  }
+
+  return normalized;
+};
+
 const computeDisplayScore = (spot, d, tidesByStation) => {
   if (!spot || !d) return null;
   const configId = LEGACY_SPOT_CONFIG_ID[spot.id];
-  const spotConfig = configId ? SPOT_CONFIG_BY_ID[configId] : null;
+  const spotConfig = spot.scoringConfig || (configId ? SPOT_CONFIG_BY_ID[configId] : null);
   if (!spotConfig) return null;
 
   const swellHeightM = Number.isFinite(d.swellHeight) && d.swellHeight > 0 ? d.swellHeight : d.waveHeight;
@@ -340,54 +496,74 @@ const fetchTomTomLocationOptions = async (query, apiKey, opts = {}) => {
   }
 };
 
-/** Parse JSON object with zip + place from Claude response (allows markdown fences). */
-const parseSurfSpotZipPayload = text => {
-  const t = String(text || "").trim();
-  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const raw = fenced ? fenced[1].trim() : t;
-  const objMatch = raw.match(/\{[\s\S]*\}/);
-  if (!objMatch) return null;
-  try {
-    const j = JSON.parse(objMatch[0]);
-    const digits = String(j.zip ?? "").replace(/\D/g, "");
-    const zip = digits.length >= 5 ? digits.slice(0, 5) : "";
-    if (!/^\d{5}$/.test(zip)) return null;
-    const place = typeof j.place === "string" ? j.place.trim() : "";
-    const difficulty = typeof j.difficulty === "string" ? j.difficulty.trim() : "";
-    const typeRaw = typeof j.type === "string" ? j.type.trim() : (typeof j.breakType === "string" ? j.breakType.trim() : "");
-    return { zip, place, difficulty, type: typeRaw };
-  } catch {
-    return null;
-  }
-};
-
-/**
- * Minimal-token lookup: surf spot name → US ZIP + locality hint for TomTom / forecasts.
- */
-const fetchSurfSpotZipFromAnthropic = async (spotName, regionHint) => {
+const fetchSurfSpotConfigFromAnthropic = async (spotName, regionHint) => {
   const anthropicUrl = getAnthropicMessagesUrl();
-  const model = (import.meta.env.VITE_ANTHROPIC_SPOT_ZIP_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
+  const model = (import.meta.env.VITE_ANTHROPIC_SPOT_CONFIG_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
   const res = await fetch(anthropicUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      max_tokens: 180,
+      temperature: 0,
+      max_tokens: 1400,
+      system: `You are a surf forecasting expert with deep knowledge of surf breaks worldwide. When given the name of a surf break, you return a precise JSON configuration object for that break. You must respond with valid JSON only - no explanation, no markdown, no backticks. If you are uncertain about a value, make the most accurate estimate you can based on the break's known geography, coastline orientation, and surf characteristics. Never refuse - always return a best-effort JSON object.`,
       messages: [{
         role: "user",
-        content: `Surf break name: "${spotName}"
-User trip context / start area (bias): ${regionHint || "California coast, USA"}
+        content: `Return a JSON object for the surf break: "${spotName}"
 
-Reply with ONLY valid JSON, no other text:
-{"zip":"95060","place":"Santa Cruz, CA","difficulty":"Intermediate","type":"Point Break"}
+Regional context for disambiguation: ${regionHint || "California coast, USA"}
 
-Rules:
-- zip: exactly one US 5-digit ZIP for the coastal town/area where that surf break is.
-- place: City name and US state abbreviation only (e.g. "Santa Cruz, CA") — city must be the first segment before the comma.
-- difficulty: exactly one of: Beginner, Beginner–Inter, Intermediate, Expert Only (typical skill needed for that break).
-- type: exactly one of: Beach Break, Point Break, Reef Break.
+The object must have exactly these fields:
 
-If impossible, reply exactly: {"zip":"","place":"","difficulty":"","type":""}`,
+{
+  "id": string (slugified name, e.g. "the_hook"),
+  "name": string (proper display name),
+  "region": string (city or region name),
+  "latitude": number,
+  "longitude": number,
+  "break_type": "beach" | "reef" | "point" | "reef_point",
+  "difficulty": "beginner" | "intermediate" | "advanced" | "expert",
+  "break_facing_direction": number (degrees 0–360, direction break faces toward ocean),
+  "optimal_swell_directions": number[] (1–3 swell directions in degrees that work best),
+  "swell_direction_tolerance": number (degrees, typically 15–45),
+  "min_rideable_ft": number,
+  "optimal_height_min_ft": number,
+  "optimal_height_max_ft": number,
+  "max_rideable_ft": number,
+  "min_period_s": number,
+  "optimal_tide_range_ft": [number, number] (MLLW feet, e.g. [1.0, 3.5]),
+  "tide_preference": "low" | "mid" | "high" | "any",
+  "noaa_tide_station_id": string (ID of nearest NOAA tide station),
+  "weights": {
+    "height": number,
+    "period": number,
+    "direction": number,
+    "wind": number,
+    "tide": number
+  },
+  "notes": string (2–3 sentences on what makes this break unique),
+  "isUserAdded": true,
+  "confidence": "high" | "medium" | "low"
+}
+
+For weights: all 5 values must sum to exactly 1.0. Use your knowledge of this break's character to weight appropriately - reef/point breaks should weight direction and period higher; tide-sensitive breaks should weight tide higher; big wave spots should weight period highest.
+
+For noaa_tide_station_id: return the nearest NOAA CO-OPS station.
+Common references:
+- San Francisco area: 9414290
+- Point Reyes: 9415020
+- Santa Cruz: 9413745
+- Monterey: 9413450
+- San Diego: 9410170
+- Los Angeles / Santa Monica: 9410660
+- Morro Bay: 9412110
+- Crescent City: 9419750
+- Newport Oregon: 9435380
+- If outside the US, set noaa_tide_station_id to null.
+
+For confidence: "high" if strongly known, "medium" if regional estimate, "low" if ambiguous/obscure.
+
+Return JSON only.`,
       }],
     }),
   });
@@ -396,13 +572,8 @@ If impossible, reply exactly: {"zip":"","place":"","difficulty":"","type":""}`,
     throw new Error(json.error?.message || json.message || `HTTP ${res.status}`);
   }
   const text = json.content?.find(b => b.type === "text")?.text || "";
-  return parseSurfSpotZipPayload(text);
-};
-
-/** TomTom geocode of US ZIP → lat/lon for marine/wind/routes. */
-const geocodeUsZipWithTomTom = async (zip, apiKey) => {
-  const opts = await fetchTomTomLocationOptions(`${zip}, USA`, apiKey, { countrySet: "US", limit: 5 });
-  return opts[0] || null;
+  const parsed = parseJsonObjectFromText(text);
+  return normalizeGeneratedSpotConfig(parsed, spotName);
 };
 
 const resolveTomTomLocation = async (origin, apiKey, opts) => {
@@ -1934,54 +2105,48 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       return;
     }
     const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
-    if (!apiKey) {
-      setAddSpotStatus("TomTom API key is missing. Add VITE_TOMTOM_API_KEY to map the ZIP to coordinates.");
-      return;
-    }
 
     setAddSpotLoading(true);
-    setAddSpotStatus("Looking up ZIP (Claude)…");
+    setAddSpotStatus("Generating spot config (Claude)…");
     try {
       const regionHint = (driveOrigin.trim() || "San Francisco Bay Area, California, USA");
-      const zipPayload = await fetchSurfSpotZipFromAnthropic(name, regionHint);
-      if (!zipPayload?.zip) {
-        setAddSpotStatus("Could not get a US ZIP for that spot. Try a more specific name (e.g. “Steamer Lane, Santa Cruz”).");
-        return;
-      }
-
-      setAddSpotStatus(`ZIP ${zipPayload.zip} — mapping…`);
-      const resolved = await geocodeUsZipWithTomTom(zipPayload.zip, apiKey);
-      if (!resolved) {
-        setAddSpotStatus(`Could not geocode ZIP ${zipPayload.zip}. Check your TomTom key.`);
+      const generatedConfig = await fetchSurfSpotConfigFromAnthropic(name, regionHint);
+      if (!generatedConfig) {
+        setAddSpotStatus("Could not generate a full spot configuration. Try a more specific spot name.");
         return;
       }
 
       const dupByName = spots.some(s =>
-        normalizeSpotName(s.name) === normalizeSpotName(name)
+        normalizeSpotName(s.name) === normalizeSpotName(generatedConfig.name)
       );
-      const dupByCoords = spots.some(s =>
-        Math.abs((s.lat || 0) - resolved.lat) < 0.01 && Math.abs((s.lon || 0) - resolved.lon) < 0.01
-      );
-      if (dupByName || dupByCoords) {
+      // Coordinate-only duplicate checks were causing false positives for distinct breaks
+      // when AI returned approximate lat/lon. Keep duplicate protection name-based.
+      if (dupByName) {
         setAddSpotStatus("That spot already exists in your list.");
         return;
       }
 
-      const cityDisplay = zipPayload.place
-        ? deriveCityFromPlaceOrLabel(zipPayload.place)
-        : deriveCityFromPlaceOrLabel(resolved.label);
-      const tideMeta = getNearestTideStationMeta(resolved.lat, resolved.lon);
+      const cityDisplay = deriveCityFromPlaceOrLabel(generatedConfig.region, "Custom");
+      const fallbackTideMeta = getNearestTideStationMeta(generatedConfig.latitude, generatedConfig.longitude);
+      const tideStationId = generatedConfig.noaa_tide_station_id || fallbackTideMeta.tideStationId;
+      const uniqueSpotIdBase = generatedConfig.id || createSpotId(generatedConfig.name);
+      const uniqueSpotId = spots.some(s => s.id === uniqueSpotIdBase)
+        ? `${uniqueSpotIdBase}_${Date.now().toString(36)}`
+        : uniqueSpotIdBase;
       const nextSpot = {
-        id: createSpotId(name),
-        name,
-        shortName: name.length > 18 ? `${name.slice(0, 18)}…` : name,
-        lat: resolved.lat,
-        lon: resolved.lon,
-        type: normalizeBreakType(zipPayload.type),
-        difficulty: normalizeSpotDifficulty(zipPayload.difficulty),
+        id: uniqueSpotId,
+        name: generatedConfig.name,
+        shortName: generatedConfig.name.length > 18 ? `${generatedConfig.name.slice(0, 18)}…` : generatedConfig.name,
+        lat: generatedConfig.latitude,
+        lon: generatedConfig.longitude,
+        type: breakTypeKeyToDisplay(generatedConfig.break_type),
+        difficulty: difficultyKeyToDisplay(generatedConfig.difficulty),
         city: cityDisplay,
-        tideStationId: tideMeta.tideStationId,
-        tideStationLabel: tideMeta.tideStationLabel,
+        tideStationId,
+        tideStationLabel: tideStationId === fallbackTideMeta.tideStationId
+          ? fallbackTideMeta.tideStationLabel
+          : `NOAA ${tideStationId}`,
+        scoringConfig: generatedConfig,
       };
       const nextSpots = [...spots, nextSpot];
 
@@ -1997,9 +2162,11 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       const originForRouting = driveOriginResolved
         ? `${driveOriginResolved.lat},${driveOriginResolved.lon}`
         : driveOrigin;
-      const drive = await fetchDriveTimes([nextSpot], originForRouting);
-      if (drive?.[nextSpot.id]) {
-        setDriveTimes(prev => ({ ...prev, [nextSpot.id]: drive[nextSpot.id] }));
+      if (apiKey) {
+        const drive = await fetchDriveTimes([nextSpot], originForRouting);
+        if (drive?.[nextSpot.id]) {
+          setDriveTimes(prev => ({ ...prev, [nextSpot.id]: drive[nextSpot.id] }));
+        }
       }
 
       if (!tidesByStation[nextSpot.tideStationId]) {
