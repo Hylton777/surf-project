@@ -42,9 +42,11 @@ describe("getSwellComponentsFromMarineHour", () => {
     });
     assert.equal(components.length, 2);
     assert.equal(components[0].source, "primary");
-    assert.equal(components[0].period, 11);
+    assert.equal(components[0].physicsPeriod, 14);
+    assert.equal(components[0].displayPeriod, 11);
     assert.equal(components[1].source, "secondary");
-    assert.equal(components[1].period, 13);
+    assert.equal(components[1].physicsPeriod, 16);
+    assert.equal(components[1].displayPeriod, 13);
   });
 });
 
@@ -52,9 +54,9 @@ describe("selectBestSwellComponent", () => {
   it("prefers directionally aligned swell for Ocean Beach", () => {
     const selected = selectBestSwellComponent(
       [
-        { hsM: 0.6, period: 14, dir: 216, source: "primary" },
-        { hsM: 0.3, period: 16, dir: 269, source: "secondary" },
-        { hsM: 1.1, period: 17, dir: 306, source: "buoy" },
+        { hsM: 0.6, physicsPeriod: 14, displayPeriod: 11, dir: 216, source: "primary" },
+        { hsM: 0.3, physicsPeriod: 16, displayPeriod: 13, dir: 269, source: "secondary" },
+        { hsM: 1.1, physicsPeriod: 17, displayPeriod: 17, dir: 306, source: "buoy" },
       ],
       oceanBeach
     );
@@ -135,6 +137,24 @@ describe("computeSurfHeightForecast", () => {
     assert.equal(r.surfHeightScale, 0.48);
     assert.equal(r.source, "model");
     assert.ok(r.descriptor.length > 0);
+  });
+
+  it("uses mean period for face height when peak is shorter", () => {
+    const withPeak = computeSurfHeightForecast({
+      marineHour: {
+        swellHeight: 2,
+        swellPeriod: 14,
+        swellPeakPeriod: 11,
+        swellDir: 300,
+      },
+      spotConfig: oceanBeach,
+    });
+    const meanOnly = computeSurfHeightForecast({
+      marineHour: { swellHeight: 2, swellPeriod: 14, swellDir: 300 },
+      spotConfig: oceanBeach,
+    });
+    assert.equal(withPeak.surfHeightFt, meanOnly.surfHeightFt);
+    assert.ok(withPeak.swellPeriod < meanOnly.swellPeriod);
   });
 
   it("uses buoy NW swell instead of blocked primary for Ocean Beach", () => {

@@ -73,6 +73,15 @@ export const pickSwellPeriod = (meanPeriod, peakPeriod) => {
   return 0;
 };
 
+/** Mean period drives face-height energy; peak period is for display only. */
+export const parseSwellPeriods = (meanPeriod, peakPeriod) => {
+  const mean = Number(meanPeriod);
+  const displayPeriod = pickSwellPeriod(meanPeriod, peakPeriod);
+  const physicsPeriod =
+    Number.isFinite(mean) && mean > 0 ? mean : displayPeriod;
+  return { physicsPeriod, displayPeriod };
+};
+
 export const roundDisplayPeriodS = period => {
   const n = Number(period);
   if (!Number.isFinite(n) || n <= 0) return 0;
@@ -100,18 +109,19 @@ const isBuoyFresh = buoyObservation => {
 
 /**
  * @param {object} marineHour
- * @returns {{ hsM: number, period: number, dir: number | null, source: string }[]}
+ * @returns {{ hsM: number, physicsPeriod: number, displayPeriod: number, dir: number | null, source: string }[]}
  */
 export const getSwellComponentsFromMarineHour = marineHour => {
   const components = [];
   const add = (height, meanPeriod, peakPeriod, dir, source) => {
     const hsM = Number(height);
     if (!Number.isFinite(hsM) || hsM <= 0) return;
-    const periodN = pickSwellPeriod(meanPeriod, peakPeriod);
+    const { physicsPeriod, displayPeriod } = parseSwellPeriods(meanPeriod, peakPeriod);
     const dirN = Number(dir);
     components.push({
       hsM,
-      period: periodN,
+      physicsPeriod,
+      displayPeriod,
       dir: Number.isFinite(dirN) ? dirN : null,
       source,
     });
@@ -161,7 +171,8 @@ export const buoyToSwellComponent = buoyObservation => {
   const dir = Number(buoyObservation?.directionDeg);
   return {
     hsM,
-    period: Number.isFinite(period) && period > 0 ? period : 0,
+    physicsPeriod: Number.isFinite(period) && period > 0 ? period : 0,
+    displayPeriod: Number.isFinite(period) && period > 0 ? period : 0,
     dir: Number.isFinite(dir) ? dir : null,
     source: "buoy",
   };
@@ -213,7 +224,7 @@ export const getEffectiveSwellPeriod = marineHour => {
     getSwellComponentsFromMarineHour(marineHour),
     {}
   );
-  if (selected?.period > 0) return selected.period;
+  if (selected?.physicsPeriod > 0) return selected.physicsPeriod;
 
   const swellPeriod = Number(marineHour?.swellPeriod);
   const wavePeriod = Number(marineHour?.wavePeriod);
@@ -272,9 +283,14 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
 
   if (!selected) {
     const waveHs = Number(marineHour?.waveHeight);
+    const { physicsPeriod, displayPeriod } = parseSwellPeriods(
+      marineHour?.swellPeriod,
+      marineHour?.swellPeakPeriod
+    );
     selected = {
       hsM: Number.isFinite(waveHs) && waveHs > 0 ? waveHs : 0,
-      period: getEffectiveSwellPeriod(marineHour),
+      physicsPeriod: physicsPeriod || getEffectiveSwellPeriod(marineHour),
+      displayPeriod: displayPeriod || physicsPeriod || getEffectiveSwellPeriod(marineHour),
       dir: getEffectiveSwellDirection(marineHour),
       source: "total_wave",
       directionFactor: 0.5,
@@ -286,7 +302,8 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
     : 0;
 
   let hsM = selected.hsM;
-  let physicsPeriod = selected.period;
+  let physicsPeriod = selected.physicsPeriod;
+  let displayPeriod = selected.displayPeriod || selected.physicsPeriod;
   let swellDir = selected.dir;
   let directionFactor = selected.directionFactor ?? getDirectionAttenuation(swellDir, spotConfig);
   let source = selected.source === "buoy" ? "buoy" : "model";
@@ -297,12 +314,16 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
     hsM = blended.hsM;
     source = blended.source;
     if (buoyDirFactor >= directionFactor) {
-      const buoyPeriod = buoyComponent.period || physicsPeriod;
-      if (source === "blend" && physicsPeriod > 0 && buoyPeriod > 0) {
+      const buoyPhysics = buoyComponent.physicsPeriod || physicsPeriod;
+      const buoyDisplay = buoyComponent.displayPeriod || buoyPhysics;
+      if (source === "blend" && physicsPeriod > 0 && buoyPhysics > 0) {
         physicsPeriod =
-          (1 - blended.blendWeight) * physicsPeriod + blended.blendWeight * buoyPeriod;
+          (1 - blended.blendWeight) * physicsPeriod + blended.blendWeight * buoyPhysics;
+        displayPeriod =
+          (1 - blended.blendWeight) * displayPeriod + blended.blendWeight * buoyDisplay;
       } else {
-        physicsPeriod = buoyPeriod;
+        physicsPeriod = buoyPhysics;
+        displayPeriod = buoyDisplay;
       }
       swellDir = buoyComponent.dir ?? swellDir;
       directionFactor = buoyDirFactor;
@@ -339,8 +360,9 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
     swellSource: selected.source,
     buoyHsFt: Number.isFinite(buoyHsM) ? roundHalfFt(mToFt(buoyHsM)) : null,
     buoyAgeMinutes: buoyObservation?.ageMinutes ?? null,
-    swellPeriod: adjustSurfPeriod(physicsPeriod, spotConfig, periodSource),
+    swellPeriod: adjustSurfPeriod(displayPeriod, spotConfig, periodSource),
     physicsPeriod,
+    displayPeriod,
     swellDir,
     directionScore: swellDir != null ? getDirectionScore(swellDir, spotConfig) : 0,
   };
