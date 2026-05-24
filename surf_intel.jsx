@@ -399,6 +399,17 @@ const computeDisplayScore = (spot, d, tidesByStation) => {
   return computeSurfScore(conditions, spotConfig);
 };
 
+const sortSpotsByScore = (spots, spotData, tidesByStation, driveTimes) =>
+  [...spots].sort((a, b) => {
+    const aScore = computeDisplayScore(a, spotData[a.id], tidesByStation)?.score ?? -1;
+    const bScore = computeDisplayScore(b, spotData[b.id], tidesByStation)?.score ?? -1;
+    if (bScore !== aScore) return bScore - aScore;
+    const aDrive = parseDriveTimeMinutes(driveTimes[a.id]);
+    const bDrive = parseDriveTimeMinutes(driveTimes[b.id]);
+    if (aDrive !== bDrive) return aDrive - bDrive;
+    return a.shortName.localeCompare(b.shortName);
+  });
+
 const getNearestTideStationMeta = (lat, lon) => {
   const nearest = SPOTS.reduce((best, s) => {
     const dLat = s.lat - lat;
@@ -1500,15 +1511,7 @@ function Dashboard({
   const data = spotData[activeSpot.id];
   const spotTides = tidesByStation[activeSpot.tideStationId] || [];
   const activeSpotScore = computeDisplayScore(activeSpot, data, tidesByStation);
-  const sortedSpots = [...spots].sort((a, b) => {
-    const aScore = computeDisplayScore(a, spotData[a.id], tidesByStation)?.score ?? -1;
-    const bScore = computeDisplayScore(b, spotData[b.id], tidesByStation)?.score ?? -1;
-    if (bScore !== aScore) return bScore - aScore;
-    const aDrive = parseDriveTimeMinutes(driveTimes[a.id]);
-    const bDrive = parseDriveTimeMinutes(driveTimes[b.id]);
-    if (aDrive !== bDrive) return aDrive - bDrive;
-    return a.shortName.localeCompare(b.shortName);
-  });
+  const sortedSpots = sortSpotsByScore(spots, spotData, tidesByStation, driveTimes);
 
   const formatAI = text =>
     text.replace(/\*\*(.*?)\*\*/g, `<strong style="color:${THEME.accent}">$1</strong>`)
@@ -2091,6 +2094,8 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       setDriveTimes(nextDriveTimes);
       setDriveRetryTick(0);
       setTidesByStation(nextTidesByStation);
+      const topSpot = sortSpotsByScore(spots, data, nextTidesByStation, nextDriveTimes)[0];
+      if (topSpot) setActiveSpot(topSpot);
       setScreen("dashboard");
     } catch (err) {
       console.error(err);
@@ -2230,8 +2235,9 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
 
   useEffect(() => {
     if (!activeSpot || spots.some(s => s.id === activeSpot.id)) return;
-    setActiveSpot(spots[0]);
-  }, [spots, activeSpot]);
+    const topSpot = sortSpotsByScore(spots, spotData, tidesByStation, driveTimes)[0];
+    setActiveSpot(topSpot || spots[0]);
+  }, [spots, activeSpot, spotData, tidesByStation, driveTimes]);
 
   if (screen === "setup") return (
     <SetupScreen skill={skill} setSkill={setSkill} quiver={quiver}
