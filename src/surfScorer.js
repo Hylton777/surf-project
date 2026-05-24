@@ -1,4 +1,4 @@
-import { DEFAULT_WEIGHTS } from "../surfSpotConfigs";
+import { DEFAULT_WEIGHTS } from "../surfSpotConfigs.js";
 
 const COMPONENT_KEYS = ["height", "period", "direction", "wind", "tide"];
 
@@ -37,15 +37,28 @@ const getHeightScore = (swellHeight, spotConfig) => {
   return 0;
 };
 
-const getPeriodScore = swellPeriod => {
+export const getPeriodScore = (swellPeriod, minPeriod = 8) => {
   if (!Number.isFinite(swellPeriod)) return 0;
-  if (swellPeriod < 6) return 0;
-  if (swellPeriod < 8) return 25;
-  if (swellPeriod < 10) return 50;
-  if (swellPeriod < 12) return 70;
-  if (swellPeriod < 15) return 85;
-  if (swellPeriod < 18) return 95;
-  return 100;
+  const min = Number.isFinite(minPeriod) ? minPeriod : 8;
+
+  if (swellPeriod >= min + 8) return 100;
+  if (swellPeriod >= min + 5) return 95;
+  if (swellPeriod >= min + 2) return 85;
+  if (swellPeriod >= min) return 70;
+  if (swellPeriod >= min - 1) return 55;
+  if (swellPeriod >= min - 2) return 35;
+  if (swellPeriod >= min - 4) return 15;
+  return 0;
+};
+
+export const getPeriodDeficitMultiplier = (period, minPeriod) => {
+  if (!Number.isFinite(period) || !Number.isFinite(minPeriod)) return 1;
+  if (period >= minPeriod) return 1;
+  const deficit = minPeriod - period;
+  if (deficit <= 1) return 0.85;
+  if (deficit <= 2) return 0.7;
+  if (deficit <= 4) return 0.5;
+  return 0.3;
 };
 
 const getDirectionScore = (swellDirection, spotConfig) => {
@@ -71,9 +84,9 @@ const getDirectionScore = (swellDirection, spotConfig) => {
   const t4 = 60 * scale;
 
   if (minDelta <= t1) return 100;
-  if (minDelta <= t2) return 80;
-  if (minDelta <= t3) return 55;
-  if (minDelta <= t4) return 30;
+  if (minDelta <= t2) return clamp(interpolate(minDelta, t1, t2, 100, 80), 0, 100);
+  if (minDelta <= t3) return clamp(interpolate(minDelta, t2, t3, 80, 55), 0, 100);
+  if (minDelta <= t4) return clamp(interpolate(minDelta, t3, t4, 55, 30), 0, 100);
   return 0;
 };
 
@@ -124,15 +137,43 @@ const getTideScore = (tide, spotConfig) => {
   return 15;
 };
 
-const getWeights = spotConfig => {
+const HEIGHT_WEIGHT_REDUCTION = 0.05;
+const NON_HEIGHT_WEIGHT_KEYS = ["period", "direction", "wind", "tide"];
+
+export const reduceHeightWeight = weights => {
+  const height = Number(weights.height) || 0;
+  if (height <= 0) return { ...weights };
+
+  const reduction = Math.min(HEIGHT_WEIGHT_REDUCTION, height);
+  const otherTotal = NON_HEIGHT_WEIGHT_KEYS.reduce(
+    (sum, key) => sum + (Number(weights[key]) || 0),
+    0
+  );
+  if (otherTotal <= 0) {
+    return { ...weights, height: height - reduction };
+  }
+
+  const next = { ...weights, height: height - reduction };
+  for (const key of NON_HEIGHT_WEIGHT_KEYS) {
+    const value = Number(weights[key]) || 0;
+    next[key] = value + reduction * (value / otherTotal);
+  }
+  return next;
+};
+
+export const getWeights = spotConfig => {
   const weights = { ...DEFAULT_WEIGHTS, ...(spotConfig?.weights || {}) };
-  return {
+  const merged = {
     height: Number(weights.height) || 0,
     period: Number(weights.period) || 0,
     direction: Number(weights.direction) || 0,
     wind: Number(weights.wind) || 0,
     tide: Number(weights.tide) || 0,
   };
+  if (spotConfig?.isUserAdded) {
+    return reduceHeightWeight(merged);
+  }
+  return merged;
 };
 
 const applyHardOverrides = (score, rating, breakdown, conditions, spotConfig) => {
@@ -146,7 +187,7 @@ const applyHardOverrides = (score, rating, breakdown, conditions, spotConfig) =>
     return { score: 10, rating: "Poor" };
   }
   if (conditions.swellPeriod < spotConfig.min_period_s) {
-    nextScore = Math.min(nextScore, 30);
+    nextScore *= getPeriodDeficitMultiplier(conditions.swellPeriod, spotConfig.min_period_s);
   }
   if (breakdown.directionScore === 0) {
     nextScore = Math.min(nextScore, 25);
@@ -173,7 +214,7 @@ export function computeSurfScore(conditions, spotConfig) {
 
   const breakdown = {
     heightScore: Math.round(getHeightScore(conditions.swellHeight, spotConfig)),
-    periodScore: Math.round(getPeriodScore(conditions.swellPeriod)),
+    periodScore: Math.round(getPeriodScore(conditions.swellPeriod, spotConfig.min_period_s)),
     directionScore: Math.round(getDirectionScore(conditions.swellDirection, spotConfig)),
     windScore: Math.round(getWindScore(conditions.windSpeed, windClassification)),
     tideScore: getTideScore(conditions.tide, spotConfig),

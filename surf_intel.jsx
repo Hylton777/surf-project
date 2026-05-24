@@ -546,7 +546,7 @@ The object must have exactly these fields:
   "confidence": "high" | "medium" | "low"
 }
 
-For weights: all 5 values must sum to exactly 1.0. Use your knowledge of this break's character to weight appropriately - reef/point breaks should weight direction and period higher; tide-sensitive breaks should weight tide higher; big wave spots should weight period highest.
+For weights: all 5 values must sum to exactly 1.0. Keep height around 0.20 (users see wave size separately in the UI); weight period, direction, wind, and tide more heavily. Reef/point breaks should weight direction and period higher; tide-sensitive breaks should weight tide higher; big wave spots should weight period highest.
 
 For noaa_tide_station_id: return the nearest NOAA CO-OPS station.
 Common references:

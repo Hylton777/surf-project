@@ -45,12 +45,13 @@
  *
  * min_period_s
  *   Minimum swell period required for this break to work properly.
- *   Below this threshold, apply a hard cap on the overall score.
+ *   Below this threshold, period component scores degrade and a graduated
+ *   deficit multiplier is applied to the final weighted score.
  *
  * ─── SCORING CAPS / HARD OVERRIDES ──────────────────────────────────────────
  * Apply these after computing the weighted score:
  *   - swell_height < min_rideable_ft          → "Very Poor" regardless
- *   - swell_period < min_period_s             → cap at "Poor to Fair"
+ *   - swell_period < min_period_s             → graduated score multiplier (not a hard cap)
  *   - swell_direction_score === 0             → cap at "Poor"
  *   - wind_speed > 30 kts AND onshore         → cap at "Poor"
  *   - swell_height > max_rideable_ft          → cap at "Poor" (closed out)
@@ -86,12 +87,13 @@
 // DEFAULT SCORING WEIGHTS
 // Override per-spot in the `weights` field if needed.
 // ─────────────────────────────────────────────────────────────────────────────
+// Height is de-emphasized — users see forecast size in the UI; rating focuses on quality factors.
 export const DEFAULT_WEIGHTS = {
-  height:    0.25,
-  period:    0.20,
-  direction: 0.20,
-  wind:      0.25,
-  tide:      0.10,
+  height:    0.20,
+  period:    0.213,
+  direction: 0.213,
+  wind:      0.267,
+  tide:      0.107,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,11 +140,11 @@ export const SPOT_CONFIGS = [
     // Period matters more at OB than a typical beachbreak because
     // long-period swells focus energy on the sandbars differently.
     weights: {
-      height:    0.25,
-      period:    0.25, // bumped up
-      direction: 0.20,
-      wind:      0.20, // slightly reduced — OB can handle moderate onshores
-      tide:      0.10,
+      height:    0.20,
+      period:    0.267, // bumped up
+      direction: 0.213,
+      wind:      0.213, // slightly reduced — OB can handle moderate onshores
+      tide:      0.107,
     },
 
     notes: `
@@ -243,11 +245,11 @@ export const SPOT_CONFIGS = [
 
     // Tide is more critical here than at a standard beachbreak
     weights: {
-      height:    0.25,
-      period:    0.18,
-      direction: 0.20,
-      wind:      0.22,
-      tide:      0.15, // bumped up — lagoon dynamics make tide more impactful
+      height:    0.20,
+      period:    0.192,
+      direction: 0.213,
+      wind:      0.235,
+      tide:      0.160, // bumped up — lagoon dynamics make tide more impactful
     },
 
     notes: `
@@ -302,11 +304,11 @@ export const SPOT_CONFIGS = [
     // Swell direction matters enormously here — reef points are picky.
     // Period also critical; the reef needs energy to focus properly.
     weights: {
-      height:    0.22,
-      period:    0.23, // bumped — reef needs real period to fire
-      direction: 0.25, // bumped — reef is very direction-sensitive
-      wind:      0.22,
-      tide:      0.08,
+      height:    0.17,
+      period:    0.245, // bumped — reef needs real period to fire
+      direction: 0.266, // bumped — reef is very direction-sensitive
+      wind:      0.234,
+      tide:      0.085,
     },
 
     notes: `
@@ -452,11 +454,11 @@ export const SPOT_CONFIGS = [
     // Height is less of a discriminator (it's always big enough or it isn't).
     // Wind still matters for safety and wave face quality.
     weights: {
-      height:    0.15, // reduced — it's almost binary (on/off)
-      period:    0.35, // critical — needs long-period swell to generate power
-      direction: 0.30, // critical — the reef only catches specific NW angles
-      wind:      0.15, // still matters for safety, but secondary concern
-      tide:      0.05,
+      height:    0.10, // reduced — it's almost binary (on/off)
+      period:    0.370, // critical — needs long-period swell to generate power
+      direction: 0.318, // critical — the reef only catches specific NW angles
+      wind:      0.159, // still matters for safety, but secondary concern
+      tide:      0.053,
     },
 
     notes: `
@@ -516,11 +518,11 @@ export const SPOT_CONFIGS = [
     // The refraction and wide swell window make direction slightly less
     // punishing than Steamer Lane. Wind is important for surface quality.
     weights: {
-      height:    0.25,
-      period:    0.22,
-      direction: 0.18, // slightly reduced — wide swell window from refraction
-      wind:      0.25,
-      tide:      0.10,
+      height:    0.20,
+      period:    0.234,
+      direction: 0.192, // slightly reduced — wide swell window from refraction
+      wind:      0.267,
+      tide:      0.107,
     },
 
     notes: `

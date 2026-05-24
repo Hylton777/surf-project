@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "preview:ai": "node server/anthropic-proxy.mjs & vite preview",
-    "proxy:anthropic": "node server/anthropic-proxy.mjs"
+    "proxy:anthropic": "node server/anthropic-proxy.mjs",
+    "test": "node --test src/surfScorer.test.js"
   },
   "dependencies": {
     "react": "^18.3.1",
