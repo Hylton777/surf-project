@@ -2,24 +2,15 @@ import dns from "node:dns";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import { anthropicProxyErrorMessage, fetchAnthropicWithRetry } from "./server/anthropic-upstream.mjs";
+import { fetchNdbcSpecUpstream } from "./server/ndbc-upstream.mjs";
 
 async function proxyNdbcSpec(req, res, stationId) {
-  const id = String(stationId || "").replace(/\D/g, "");
-  if (!id) {
-    res.statusCode = 400;
-    res.setHeader("Content-Type", "text/plain");
-    res.end("Invalid station id");
-    return;
-  }
   try {
-    const upstream = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${id}.spec`, {
-      headers: { "user-agent": "SurfIntel/1.0" },
-    });
-    const text = await upstream.text();
-    res.statusCode = upstream.status;
+    const result = await fetchNdbcSpecUpstream(stationId);
+    res.statusCode = result.status;
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=300");
-    res.end(text);
+    res.end(result.text);
   } catch (e) {
     console.error("[ndbc-dev-proxy] fetch failed:", e);
     res.statusCode = 502;

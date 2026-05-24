@@ -2,6 +2,9 @@
   "functions": {
     "api/anthropic/messages.js": {
       "maxDuration": 60
+    },
+    "api/ndbc/[stationId]/spec.js": {
+      "maxDuration": 15
     }
   }
 }

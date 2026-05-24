@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { fetchAnthropicWithRetry } from "./anthropic-upstream.mjs";
+import { fetchNdbcSpecUpstream } from "./ndbc-upstream.mjs";
 
 dns.setDefaultResultOrder("ipv4first");
 {
@@ -66,22 +67,13 @@ const server = http.createServer(async (req, res) => {
 
   const ndbcMatch = req.url?.match(/^\/api\/ndbc\/([^/]+)\/spec\/?$/);
   if (req.method === "GET" && ndbcMatch) {
-    const id = String(ndbcMatch[1]).replace(/\D/g, "");
-    if (!id) {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Invalid station id");
-      return;
-    }
     try {
-      const upstream = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${id}.spec`, {
-        headers: { "user-agent": "SurfIntel/1.0" },
-      });
-      const text = await upstream.text();
-      res.writeHead(upstream.status, {
+      const result = await fetchNdbcSpecUpstream(ndbcMatch[1]);
+      res.writeHead(result.status, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "public, max-age=300",
       });
-      res.end(text);
+      res.end(result.text);
     } catch (e) {
       res.writeHead(502, { "Content-Type": "text/plain" });
       res.end(e?.message || "NDBC upstream error");
