@@ -3,6 +3,31 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import { anthropicProxyErrorMessage, fetchAnthropicWithRetry } from "./server/anthropic-upstream.mjs";
 
+async function proxyNdbcSpec(req, res, stationId) {
+  const id = String(stationId || "").replace(/\D/g, "");
+  if (!id) {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "text/plain");
+    res.end("Invalid station id");
+    return;
+  }
+  try {
+    const upstream = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${id}.spec`, {
+      headers: { "user-agent": "SurfIntel/1.0" },
+    });
+    const text = await upstream.text();
+    res.statusCode = upstream.status;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.end(text);
+  } catch (e) {
+    console.error("[ndbc-dev-proxy] fetch failed:", e);
+    res.statusCode = 502;
+    res.setHeader("Content-Type", "text/plain");
+    res.end("NDBC upstream error");
+  }
+}
+
 // Prefer IPv4 when resolving api.anthropic.com — broken IPv6 routes often surface as undici "fetch failed".
 dns.setDefaultResultOrder("ipv4first");
 
@@ -29,6 +54,10 @@ export default defineConfig(({ mode }) => {
         name: "anthropic-dev-proxy",
         configureServer(server) {
           server.middlewares.use(async (req, res, next) => {
+            const ndbcMatch = req.url?.match(/^\/api\/ndbc\/([^/]+)\/spec\/?$/);
+            if (req.method === "GET" && ndbcMatch) {
+              return proxyNdbcSpec(req, res, ndbcMatch[1]);
+            }
             if (req.method !== "POST" || !req.url?.startsWith("/api/anthropic/messages")) {
               return next();
             }

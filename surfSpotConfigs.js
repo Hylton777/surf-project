@@ -81,13 +81,45 @@
  * @property {string}   tide_preference                 - "low" | "mid" | "high" | "any"
  * @property {Object}   weights                         - override default scoring weights for this spot
  * @property {string}   notes                           - human-readable forecasting notes
+ * @property {string}   [ndbc_station_id]               - nearest NDBC buoy for observation blend
+ * @property {number}   [face_multiplier]               - optional override for Hs→face conversion
+ * @property {number}   surf_height_scale               - spot calibration vs offshore/buoy (0–1 typical)
+ * @property {number}   [surf_period_scale]             - nearshore period calibration (0.9–1 typical for model peak)
  */
+
+/** Default surf-height scale when a spot has no explicit `surf_height_scale`. */
+export const DEFAULT_SURF_HEIGHT_SCALE_BY_BREAK_TYPE = {
+  beach: 0.54,
+  point: 0.62,
+  reef_point: 0.62,
+  reef: 0.48,
+};
+
+export const getDefaultSurfHeightScale = breakType => {
+  const key = String(breakType || "beach").toLowerCase();
+  return DEFAULT_SURF_HEIGHT_SCALE_BY_BREAK_TYPE[key] ?? 0.55;
+};
+
+/** Default display-period scale for model peak period (light nearshore damping). */
+export const DEFAULT_SURF_PERIOD_SCALE_BY_BREAK_TYPE = {
+  beach: 0.93,
+  point: 0.96,
+  reef_point: 0.96,
+  reef: 0.94,
+};
+
+export const getDefaultSurfPeriodScale = breakType => {
+  const key = String(breakType || "beach").toLowerCase();
+  return DEFAULT_SURF_PERIOD_SCALE_BY_BREAK_TYPE[key] ?? 0.94;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DEFAULT SCORING WEIGHTS
 // Override per-spot in the `weights` field if needed.
 // ─────────────────────────────────────────────────────────────────────────────
 // Height is de-emphasized — users see forecast size in the UI; rating focuses on quality factors.
+export const DEFAULT_NDBC_STATION_ID = "46214";
+
 export const DEFAULT_WEIGHTS = {
   height:    0.20,
   period:    0.213,
@@ -113,8 +145,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "beach",
     difficulty: "advanced",
+    ndbc_station_id: "46214",
+    surf_height_scale: 0.48,
 
-    // Faces due west. Powerful shore break driven by open-ocean NW/W swells.
+    // Faces due west.
     break_facing_direction: 270,
 
     // Works best on NW and WNW swells. Due-W swells also work.
@@ -170,8 +204,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "beach",
     difficulty: "beginner",
+    ndbc_station_id: "46214",
+    surf_height_scale: 0.54,
 
-    // Faces WSW. Slightly more southerly aspect than OB,
+    // Faces WSW.
     // giving it a wider swell window and more protection from north winds.
     break_facing_direction: 255,
 
@@ -218,8 +254,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "beach",
     difficulty: "intermediate",
+    ndbc_station_id: "46013",
+    surf_height_scale: 0.56,
 
-    // Faces WNW. Sits at the mouth of Bolinas Lagoon.
+    // Faces WNW.
     // The lagoon channel creates shifting sandbars.
     break_facing_direction: 290,
 
@@ -274,6 +312,8 @@ export const SPOT_CONFIGS = [
 
     break_type: "reef_point",
     difficulty: "advanced",
+    ndbc_station_id: "46042",
+    surf_height_scale: 0.62,
 
     // Faces NW. Multiple sections: Indicators (outside), Middle Peak, The Slot.
     // This is the primary direction for the main peaks.
@@ -334,8 +374,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "beach",
     difficulty: "intermediate",
+    ndbc_station_id: "46214",
+    surf_height_scale: 0.54,
 
-    // Faces due west. Exposed beach with no significant headland shelter.
+    // Faces due west.
     break_facing_direction: 272,
 
     // Open to NW through W swells. Slightly less protected than Linda Mar.
@@ -378,8 +420,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "beach",
     difficulty: "intermediate",
+    ndbc_station_id: "46214",
+    surf_height_scale: 0.55,
 
-    // Faces W/WSW. Positioned just south of Pillar Point, which provides
+    // Faces W/WSW.
     // partial shelter from the largest direct NW swells.
     break_facing_direction: 263,
 
@@ -424,8 +468,11 @@ export const SPOT_CONFIGS = [
 
     break_type: "reef",
     difficulty: "expert",
+    ndbc_station_id: "46214",
+    face_multiplier: 1.35,
+    surf_height_scale: 0.42,
 
-    // Faces NW. Offshore reef break outside Pillar Point.
+    // Faces NW.
     break_facing_direction: 310,
 
     // Mavericks is extremely direction-sensitive. It requires large NW
@@ -487,8 +534,10 @@ export const SPOT_CONFIGS = [
 
     break_type: "reef_point",
     difficulty: "intermediate",
+    ndbc_station_id: "46042",
+    surf_height_scale: 0.60,
 
-    // Faces SW/WSW. The point juts southward, so NW and W swells
+    // Faces SW/WSW.
     // wrap around the point to create long, peeling rights.
     // This is the effective facing direction for scoring purposes.
     break_facing_direction: 235,

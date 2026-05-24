@@ -55,12 +55,37 @@ if (!API_KEY) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  const ndbcMatch = req.url?.match(/^\/api\/ndbc\/([^/]+)\/spec\/?$/);
+  if (req.method === "GET" && ndbcMatch) {
+    const id = String(ndbcMatch[1]).replace(/\D/g, "");
+    if (!id) {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Invalid station id");
+      return;
+    }
+    try {
+      const upstream = await fetch(`https://www.ndbc.noaa.gov/data/realtime2/${id}.spec`, {
+        headers: { "user-agent": "SurfIntel/1.0" },
+      });
+      const text = await upstream.text();
+      res.writeHead(upstream.status, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "public, max-age=300",
+      });
+      res.end(text);
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end(e?.message || "NDBC upstream error");
+    }
     return;
   }
 

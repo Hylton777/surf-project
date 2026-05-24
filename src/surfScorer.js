@@ -1,15 +1,9 @@
 import { DEFAULT_WEIGHTS } from "../surfSpotConfigs.js";
+import { getDirectionScore } from "./swellDirection.js";
 
 const COMPONENT_KEYS = ["height", "period", "direction", "wind", "tide"];
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-
-const normalizeAngle = degrees => ((degrees % 360) + 360) % 360;
-
-const angularDifference = (a, b) => {
-  const delta = Math.abs(normalizeAngle(a) - normalizeAngle(b));
-  return Math.min(delta, 360 - delta);
-};
 
 const interpolate = (value, inMin, inMax, outMin, outMax) => {
   if (inMax === inMin) return outMax;
@@ -59,35 +53,6 @@ export const getPeriodDeficitMultiplier = (period, minPeriod) => {
   if (deficit <= 2) return 0.7;
   if (deficit <= 4) return 0.5;
   return 0.3;
-};
-
-const getDirectionScore = (swellDirection, spotConfig) => {
-  if (!Number.isFinite(swellDirection)) return 0;
-  const optimal = Array.isArray(spotConfig.optimal_swell_directions)
-    ? spotConfig.optimal_swell_directions
-    : [];
-  if (!optimal.length) return 0;
-
-  const minDelta = optimal.reduce(
-    (best, dir) => Math.min(best, angularDifference(swellDirection, dir)),
-    Number.POSITIVE_INFINITY
-  );
-
-  const baseTolerance = 30;
-  const scale = Number.isFinite(spotConfig.swell_direction_tolerance)
-    ? spotConfig.swell_direction_tolerance / baseTolerance
-    : 1;
-
-  const t1 = 15 * scale;
-  const t2 = 30 * scale;
-  const t3 = 45 * scale;
-  const t4 = 60 * scale;
-
-  if (minDelta <= t1) return 100;
-  if (minDelta <= t2) return clamp(interpolate(minDelta, t1, t2, 100, 80), 0, 100);
-  if (minDelta <= t3) return clamp(interpolate(minDelta, t2, t3, 80, 55), 0, 100);
-  if (minDelta <= t4) return clamp(interpolate(minDelta, t3, t4, 55, 30), 0, 100);
-  return 0;
 };
 
 const classifyWind = (windDirection, breakFacingDirection) => {

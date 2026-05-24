@@ -1,6 +1,12 @@
 import React, { useState, useEffect } from "react";
-import { DEFAULT_WEIGHTS, SPOT_CONFIGS } from "./surfSpotConfigs";
+import { DEFAULT_NDBC_STATION_ID, DEFAULT_WEIGHTS, SPOT_CONFIGS, getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "./surfSpotConfigs";
 import { computeSurfScore } from "./src/surfScorer";
+import {
+  computeSurfHeightForecast,
+  marineHourFromArrays,
+  roundHalfFt,
+} from "./src/surfForecast";
+import { fetchNdbcBuoyObservation, fetchNdbcBuoysByStation } from "./src/ndbcClient";
 
 // ─── Data ───────────────────────────────────────────────────────────────────
 
@@ -62,8 +68,11 @@ const POSTCARD_BG = `
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const mToFt = m => m * 3.28084;
-const roundHalfFt = ft => Math.round(ft * 2) / 2;
 const fmtFt = (m, d = 1) => roundHalfFt(mToFt(m)).toFixed(d);
+const fmtSurfFt = ft => {
+  const rounded = roundHalfFt(ft);
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Vite dev: `/api/anthropic/messages`. Standalone proxy: `origin` + `/v1/messages`. */
@@ -361,6 +370,22 @@ const normalizeGeneratedSpotConfig = (cfg, fallbackName) => {
       ? String(cfg.tide_preference).trim().toLowerCase()
       : "mid",
     noaa_tide_station_id: cfg.noaa_tide_station_id == null ? null : String(cfg.noaa_tide_station_id).trim(),
+    ndbc_station_id: cfg.ndbc_station_id == null || String(cfg.ndbc_station_id).trim() === ""
+      ? null
+      : String(cfg.ndbc_station_id).replace(/\D/g, ""),
+    face_multiplier: Number.isFinite(Number(cfg.face_multiplier)) && Number(cfg.face_multiplier) > 0
+      ? Number(cfg.face_multiplier)
+      : null,
+    surf_height_scale: (() => {
+      const custom = Number(cfg.surf_height_scale);
+      if (Number.isFinite(custom) && custom > 0) return Math.min(1.5, custom);
+      return getDefaultSurfHeightScale(normalizeBreakTypeKey(cfg.break_type));
+    })(),
+    surf_period_scale: (() => {
+      const custom = Number(cfg.surf_period_scale);
+      if (Number.isFinite(custom) && custom > 0) return Math.min(1.2, custom);
+      return getDefaultSurfPeriodScale(normalizeBreakTypeKey(cfg.break_type));
+    })(),
     weights: normalizeWeightsToUnitSum(cfg.weights),
     notes: String(cfg.notes || "").trim() || "User-added surf break configuration.",
     isUserAdded: true,
@@ -382,14 +407,11 @@ const normalizeGeneratedSpotConfig = (cfg, fallbackName) => {
 
 const computeDisplayScore = (spot, d, tidesByStation) => {
   if (!spot || !d) return null;
-  const configId = LEGACY_SPOT_CONFIG_ID[spot.id];
-  const spotConfig = spot.scoringConfig || (configId ? SPOT_CONFIG_BY_ID[configId] : null);
+  const spotConfig = getSpotScoringConfig(spot);
   if (!spotConfig) return null;
 
-  const swellHeightM = Number.isFinite(d.swellHeight) && d.swellHeight > 0 ? d.swellHeight : d.waveHeight;
   const conditions = {
-    // Existing app data is in meters; scorer expects feet.
-    swellHeight: Number.isFinite(swellHeightM) ? mToFt(swellHeightM) : 0,
+    swellHeight: Number.isFinite(d.surfHeightFt) ? d.surfHeightFt : 0,
     swellPeriod: Number.isFinite(d.swellPeriod) && d.swellPeriod > 0 ? d.swellPeriod : d.wavePeriod,
     swellDirection: Number.isFinite(d.swellDir) ? d.swellDir : d.waveDir,
     windSpeed: (Number(d.windSpeed) || 0) * MPH_TO_KNOTS,
@@ -424,10 +446,57 @@ const getNearestTideStationMeta = (lat, lon) => {
   };
 };
 
+const getSpotScoringConfig = spot => {
+  const configId = LEGACY_SPOT_CONFIG_ID[spot.id];
+  return spot.scoringConfig || (configId ? SPOT_CONFIG_BY_ID[configId] : null);
+};
+
+const getNdbcStationIdForSpot = spot => {
+  const cfg = getSpotScoringConfig(spot);
+  return cfg?.ndbc_station_id || DEFAULT_NDBC_STATION_ID;
+};
+
+const getNearestBuoyMeta = (lat, lon) => {
+  const nearest = SPOTS.reduce((best, s) => {
+    const dLat = s.lat - lat;
+    const dLon = s.lon - lon;
+    const score = dLat * dLat + dLon * dLon;
+    if (!best || score < best.score) return { score, spot: s };
+    return best;
+  }, null);
+  const refSpot = nearest?.spot || SPOTS[0];
+  return { ndbcStationId: getNdbcStationIdForSpot(refSpot) };
+};
+
+const buoyObservationForBlend = obs =>
+  obs && Number.isFinite(obs.hsM)
+    ? {
+        hsM: obs.hsM,
+        swellHsM: obs.swellHsM,
+        periodS: obs.periodS,
+        directionDeg: obs.directionDeg,
+        ageMinutes: obs.ageMinutes,
+      }
+    : null;
+
+const forecastHourAtIndex = (marineJson, spotConfig, buoyObservation, i) => {
+  const marineHour = marineHourFromArrays(marineJson.hourly, i);
+  return computeSurfHeightForecast({ marineHour, spotConfig, buoyObservation });
+};
+
+const buildSurfHeightSeries = (marineJson, spotConfig, buoyObservation, startIdx, count) => {
+  const len = marineJson?.hourly?.time?.length || 0;
+  const series = [];
+  for (let i = startIdx; i < startIdx + count && i < len; i++) {
+    series.push(forecastHourAtIndex(marineJson, spotConfig, buoyObservation, i).surfHeightFt);
+  }
+  return series;
+};
+
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const fetchMarine = (lat, lon) =>
-  fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction&forecast_days=2&timezone=America%2FLos_Angeles`)
+  fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,wave_peak_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_peak_period,swell_wave_direction,secondary_swell_wave_height,secondary_swell_wave_period,secondary_swell_wave_direction,wind_wave_height,wind_wave_period,wind_wave_peak_period,wind_wave_direction&forecast_days=2&timezone=America%2FLos_Angeles`)
     .then(r => r.json());
 
 const fetchWind = (lat, lon) =>
@@ -545,6 +614,10 @@ The object must have exactly these fields:
   "optimal_tide_range_ft": [number, number] (MLLW feet, e.g. [1.0, 3.5]),
   "tide_preference": "low" | "mid" | "high" | "any",
   "noaa_tide_station_id": string (ID of nearest NOAA tide station),
+  "ndbc_station_id": string | null (nearest NDBC buoy, e.g. "46214" Half Moon Bay, "46042" Monterey, "46013" Bodega Bay),
+  "face_multiplier": number | null (optional Hs→face override for unusual breaks),
+  "surf_height_scale": number (0.4–0.7 typical; calibrates displayed face height to local break — beach ~0.54, reef_point ~0.62, reef ~0.48),
+  "surf_period_scale": number (0.9–1.0 typical; calibrates displayed swell period — beach ~0.93, reef_point ~0.96),
   "weights": {
     "height": number,
     "period": number,
@@ -571,6 +644,12 @@ Common references:
 - Crescent City: 9419750
 - Newport Oregon: 9435380
 - If outside the US, set noaa_tide_station_id to null.
+
+For ndbc_station_id: return nearest NDBC buoy ID for US West Coast breaks.
+Common references: 46214 (Half Moon Bay), 46042 (Monterey), 46013 (Bodega Bay), 46026 (San Francisco).
+If outside the US or unknown, set ndbc_station_id to null.
+
+For surf_height_scale: use break-type defaults unless you know the spot well — beach 0.54, reef_point 0.62, reef 0.48, point 0.62.
 
 For confidence: "high" if strongly known, "medium" if regional estimate, "low" if ambiguous/obscure.
 
@@ -629,8 +708,14 @@ const fetchMissingDriveTimes = async (spots, existingDriveTimes = {}, originInpu
   return fetchDriveTimes(missing, originInput);
 };
 
-const buildSpotCondition = (spot, marineJson, windJson) => {
+const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}) => {
   if (!marineJson?.hourly) return null;
+  const spotConfig = getSpotScoringConfig(spot);
+  if (!spotConfig) return null;
+
+  const ndbcId = getNdbcStationIdForSpot(spot);
+  const buoyObservation = buoyObservationForBlend(buoyByStation[ndbcId]);
+
   const hi = getCurrentHourIdx(marineJson.hourly.time);
   const wi = alignHourIdx(marineJson.hourly.time, windJson?.hourly?.time, hi);
   const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
@@ -641,43 +726,55 @@ const buildSpotCondition = (spot, marineJson, windJson) => {
     ? Math.max(0, hourlyTimes.findIndex(t => typeof t === "string" && t.startsWith(todayPrefix)))
     : 0;
   const dayTimes = hourlyTimes.slice(dayStartIdx, dayStartIdx + 24);
-  const dayWaveHeights = (marineJson.hourly.wave_height || []).slice(dayStartIdx, dayStartIdx + 24);
+
+  const currentForecast = forecastHourAtIndex(marineJson, spotConfig, buoyObservation, hi);
+  const daySurfHeights = buildSurfHeightSeries(marineJson, spotConfig, buoyObservation, dayStartIdx, 24);
+  const forecastSurf = buildSurfHeightSeries(marineJson, spotConfig, buoyObservation, hi, 12);
 
   return {
-    waveHeight:  marineJson.hourly.wave_height?.[hi]          ?? 0,
-    wavePeriod:  marineJson.hourly.wave_period?.[hi]          ?? 0,
-    waveDir:     marineJson.hourly.wave_direction?.[hi]        ?? 0,
-    swellHeight: marineJson.hourly.swell_wave_height?.[hi]    ?? 0,
-    swellPeriod: marineJson.hourly.swell_wave_period?.[hi]    ?? 0,
-    swellDir:    marineJson.hourly.swell_wave_direction?.[hi] ?? 0,
-    windSpeed:   windJson?.hourly?.wind_speed_10m?.[wi]       ?? 0,
-    windDir:     windJson?.hourly?.wind_direction_10m?.[wi]   ?? 0,
-    times:       sl(marineJson.hourly.time, hi),
-    forecastWave: sl(marineJson.hourly.wave_height, hi),
+    waveHeight: marineJson.hourly.wave_height?.[hi] ?? 0,
+    wavePeriod: marineJson.hourly.wave_period?.[hi] ?? 0,
+    waveDir: marineJson.hourly.wave_direction?.[hi] ?? 0,
+    swellHeight: marineJson.hourly.swell_wave_height?.[hi] ?? 0,
+    swellPeriod: currentForecast.swellPeriod,
+    swellDir: currentForecast.swellDir ?? marineJson.hourly.swell_wave_direction?.[hi] ?? 0,
+    windWaveHeight: marineJson.hourly.wind_wave_height?.[hi] ?? 0,
+    windSpeed: windJson?.hourly?.wind_speed_10m?.[wi] ?? 0,
+    windDir: windJson?.hourly?.wind_direction_10m?.[wi] ?? 0,
+    surfHeightFt: currentForecast.surfHeightFt,
+    surfHeightDescriptor: currentForecast.descriptor,
+    swellHsFt: currentForecast.swellHsFt,
+    forecastSource: currentForecast.source,
+    buoyHsFt: currentForecast.buoyHsFt,
+    buoyAgeMinutes: currentForecast.buoyAgeMinutes,
+    ndbcStationId: ndbcId,
+    times: sl(marineJson.hourly.time, hi),
+    forecastWave: forecastSurf,
     forecastWind: sl(windJson?.hourly?.wind_speed_10m, wi),
     dayTimes,
-    dayWaveHeights,
+    dayWaveHeights: daySurfHeights,
+    daySurfHeights,
   };
 };
 
-const fetchSpotCondition = async spot => {
+const fetchSpotCondition = async (spot, buoyByStation = {}) => {
   try {
     const marine = await fetchMarine(spot.lat, spot.lon).catch(() => null);
     if (!marine?.hourly) return null;
     const lat = marine?.latitude ?? spot.lat;
     const lon = marine?.longitude ?? spot.lon;
     const wind = await fetchWind(lat, lon).catch(() => null);
-    return buildSpotCondition(spot, marine, wind);
+    return buildSpotCondition(spot, marine, wind, buoyByStation);
   } catch {
     return null;
   }
 };
 
-const fetchMissingSpotData = async (spots, existingSpotData = {}) => {
+const fetchMissingSpotData = async (spots, existingSpotData = {}, buoyByStation = {}) => {
   const missing = spots.filter(s => !existingSpotData[s.id]);
   if (!missing.length) return {};
   const pairs = await Promise.all(
-    missing.map(async spot => [spot.id, await fetchSpotCondition(spot)])
+    missing.map(async spot => [spot.id, await fetchSpotCondition(spot, buoyByStation)])
   );
   return Object.fromEntries(pairs.filter(([, v]) => !!v));
 };
@@ -714,7 +811,7 @@ function Sparkline({ data, color = THEME.accent, height = 48 }) {
       <path d={path} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
       {/* Min/max labels */}
       <text x={pts[data.indexOf(max)][0]} y={pts[data.indexOf(max)][1] - 4}
-        textAnchor="middle" fontSize="8" fill={color} opacity="0.8">{fmtFt(max)}ft</text>
+        textAnchor="middle" fontSize="8" fill={color} opacity="0.8">{fmtSurfFt(max)}ft</text>
     </svg>
   );
 }
@@ -1000,8 +1097,8 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
   };
 
   const points = times
-    .map((t, i) => ({ t, ms: parseHourTime(t), heightM: Number(heights[i]) }))
-    .filter(p => Number.isFinite(p.ms) && Number.isFinite(p.heightM));
+    .map((t, i) => ({ t, ms: parseHourTime(t), heightFt: Number(heights[i]) }))
+    .filter(p => Number.isFinite(p.ms) && Number.isFinite(p.heightFt));
 
   if (!points.length) {
     return <p style={{ color: THEME.textSoft, fontSize: 12 }}>No forecast available.</p>;
@@ -1024,14 +1121,14 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
   const padTop = 30, padBot = 18, padX = 22;
   const innerW = W - 2 * padX;
   const innerH = H - padTop - padBot;
-  const heightsFt = inWindow.map(p => mToFt(p.heightM));
+  const heightsFt = inWindow.map(p => p.heightFt);
   const min = Math.min(...heightsFt) - 0.3;
   const max = Math.max(...heightsFt) + 0.3;
   const safeRange = max - min || 1;
   const xFor = ms => padX + ((ms - start) / dayMs) * innerW;
   const yFor = ft => H - padBot - ((ft - min) / safeRange) * innerH;
 
-  const cps = inWindow.map(p => ({ ...p, heightFt: mToFt(p.heightM), x: xFor(p.ms), y: yFor(mToFt(p.heightM)) }));
+  const cps = inWindow.map(p => ({ ...p, x: xFor(p.ms), y: yFor(p.heightFt) }));
 
   let path = `M ${cps[0].x},${cps[0].y}`;
   for (let i = 1; i < cps.length; i++) {
@@ -1159,7 +1256,7 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
                 fontSize="8"
                 fill={THEME.textSoft}
               >
-                ▲ {roundHalfFt(peak.heightFt).toFixed(1)}ft
+                ▲ {fmtSurfFt(peak.heightFt)}ft
               </text>
               <text
                 x={peak.x}
@@ -1225,7 +1322,7 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
               fontFamily="'Space Mono', monospace"
               fontWeight="700"
             >
-              {roundHalfFt(effectiveHover.value).toFixed(1)}ft
+              {fmtSurfFt(effectiveHover.value)}ft
             </text>
           </g>
         )}
@@ -1592,7 +1689,7 @@ function Dashboard({
                   {d ? (
                     <>
                       <div style={{ fontSize: 11, color: THEME.text, fontFamily: "'Space Mono', monospace" }}>
-                        {fmtFt(d.waveHeight)}ft @ {d.wavePeriod?.toFixed(0)}s
+                        {fmtSurfFt(d.surfHeightFt)}ft @ {d.swellPeriod?.toFixed(0)}s
                       </div>
                       <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
                         {drive ? `${drive} drive` : "Drive time —"}
@@ -1739,10 +1836,16 @@ function Dashboard({
               </div>
 
               {/* Stat cards */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
                 {[
-                  { label: "WAVE HEIGHT", value: `${fmtFt(data.waveHeight)}ft`, sub: `${fmtFt(data.swellHeight)}ft swell face` },
-                  { label: "PERIOD", value: `${data.wavePeriod?.toFixed(0)}s`, sub: `${data.swellPeriod?.toFixed(0)}s swell period` },
+                  {
+                    label: "SURF HEIGHT",
+                    value: `${fmtSurfFt(data.surfHeightFt)}ft`,
+                    sub: [
+                      data.swellPeriod ? `${data.swellPeriod.toFixed(0)}s period` : "",
+                      data.forecastSource === "blend" ? `NDBC ${data.ndbcStationId} blend` : "",
+                    ].filter(Boolean).join(" · "),
+                  },
                   { label: "SWELL DIR", value: degToCompass(data.swellDir), sub: `${Math.round(data.swellDir || 0)}° bearing` },
                   {
                     label: "WIND",
@@ -1779,10 +1882,10 @@ function Dashboard({
 
               {/* 24-hr wave forecast (full width) */}
               <div style={{ background: THEME.panel, borderRadius: 8, padding: "13px 16px", border: `1px solid ${THEME.border}`, marginBottom: 16 }}>
-                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 14 }}>24-HR WAVE FORECAST</div>
+                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 14 }}>24-HR SURF FORECAST (FACE HEIGHT)</div>
                 <WaveForecastChart
                   times={data.dayTimes}
-                  heights={data.dayWaveHeights}
+                  heights={data.daySurfHeights ?? data.dayWaveHeights}
                   syncMs={syncMs}
                   onSyncHover={setSyncMs}
                 />
@@ -1893,7 +1996,8 @@ function Dashboard({
               <div key={s} style={{ fontSize: 9, color: THEME.muted, marginBottom: 4 }}>· {s}</div>
             ))}
             <div style={{ fontSize: 9, color: THEME.textSoft, marginTop: 12, lineHeight: 1.55 }}>
-              Swell and wind are <strong style={{ color: THEME.text }}>weather-model forecasts</strong> (not buoy readings).
+              Surf height is estimated from offshore swell, period, break type, and direction
+              {` `}(face height). When available, conditions are blended with nearby <strong style={{ color: THEME.text }}>NDBC buoy</strong> readings.
               Heights are offshore-style estimates and often differ from a given break after shoaling and local wind.
               Tide highs/lows are NOAA CO-OPS predictions for the station shown for the selected spot; each break uses the nearest applicable prediction station.
             </div>
@@ -1920,6 +2024,7 @@ export default function App() {
   const [spots, setSpots] = useState(SPOTS);
   const [spotData, setSpotData] = useState({});
   const [driveTimes, setDriveTimes] = useState({});
+  const [buoyByStation, setBuoyByStation] = useState({});
   const [spotRetryTick, setSpotRetryTick] = useState(0);
   const [tidesByStation, setTidesByStation] = useState({});
   const [activeSpot, setActiveSpot] = useState(SPOTS[0]);
@@ -1988,7 +2093,7 @@ export default function App() {
     const condLines = spotsForAi.map(s => {
       const d = data[s.id];
       if (!d) return `${s.name}: no data`;
-      return `${s.name} (${s.type}, ${s.difficulty}): ${fmtFt(d.waveHeight)}ft @ ${d.wavePeriod?.toFixed(0)}s, swell ${fmtFt(d.swellHeight)}ft from ${degToCompass(d.swellDir)}, wind ${d.windSpeed?.toFixed(0)}mph from ${degToCompass(d.windDir)}`;
+      return `${s.name} (${s.type}, ${s.difficulty}): ${fmtSurfFt(d.surfHeightFt)}ft, ${d.swellPeriod?.toFixed(0)}s swell from ${degToCompass(d.swellDir)}, wind ${d.windSpeed?.toFixed(0)}mph from ${degToCompass(d.windDir)}${d.forecastSource === "blend" ? ", NDBC blend" : ""}`;
     }).join("\n");
 
     const tideBlock = spotsForAi.map(s => {
@@ -2076,6 +2181,8 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       const tideJsons = await Promise.all(
         uniqueTideIds.map(id => fetchTides(id).catch(() => ({ predictions: [] })))
       );
+      const ndbcIds = [...new Set(spots.map(s => getNdbcStationIdForSpot(s)))];
+      const nextBuoyByStation = await fetchNdbcBuoysByStation(ndbcIds);
       const resolved = driveOriginResolved || await resolveAndAutofillDriveOrigin();
       const originForRouting = resolved ? `${resolved.lat},${resolved.lon}` : driveOrigin;
       const nextDriveTimes = await fetchDriveTimes(spots, originForRouting);
@@ -2086,10 +2193,11 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
 
       const data = {};
       spots.forEach((spot, i) => {
-        data[spot.id] = buildSpotCondition(spot, marines[i], winds[i]);
+        data[spot.id] = buildSpotCondition(spot, marines[i], winds[i], nextBuoyByStation);
       });
 
       setSpotData(data);
+      setBuoyByStation(nextBuoyByStation);
       setSpotRetryTick(0);
       setDriveTimes(nextDriveTimes);
       setDriveRetryTick(0);
@@ -2133,6 +2241,10 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
 
       const cityDisplay = deriveCityFromPlaceOrLabel(generatedConfig.region, "Custom");
       const fallbackTideMeta = getNearestTideStationMeta(generatedConfig.latitude, generatedConfig.longitude);
+      const fallbackBuoyMeta = getNearestBuoyMeta(generatedConfig.latitude, generatedConfig.longitude);
+      if (!generatedConfig.ndbc_station_id) {
+        generatedConfig.ndbc_station_id = fallbackBuoyMeta.ndbcStationId;
+      }
       const tideStationId = generatedConfig.noaa_tide_station_id || fallbackTideMeta.tideStationId;
       const uniqueSpotIdBase = generatedConfig.id || createSpotId(generatedConfig.name);
       const uniqueSpotId = spots.some(s => s.id === uniqueSpotIdBase)
@@ -2159,7 +2271,15 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
       setActiveSpot(nextSpot);
       setAddSpotStatus(`Added ${nextSpot.name}. Fetching conditions...`);
 
-      const condition = await fetchSpotCondition(nextSpot);
+      const ndbcId = generatedConfig.ndbc_station_id;
+      let buoysForFetch = buoyByStation;
+      if (ndbcId && !buoysForFetch[ndbcId]) {
+        const obs = await fetchNdbcBuoyObservation(ndbcId);
+        buoysForFetch = { ...buoysForFetch, [ndbcId]: obs };
+        setBuoyByStation(buoysForFetch);
+      }
+
+      const condition = await fetchSpotCondition(nextSpot, buoysForFetch);
       if (condition) {
         setSpotData(prev => ({ ...prev, [nextSpot.id]: condition }));
       }
@@ -2223,7 +2343,7 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     if (spotRetryTick >= 6) return; // Stop after ~1 minute of retries.
 
     const timer = setTimeout(async () => {
-      const recovered = await fetchMissingSpotData(spots, spotData);
+      const recovered = await fetchMissingSpotData(spots, spotData, buoyByStation);
       if (Object.keys(recovered).length) {
         setSpotData(prev => ({ ...prev, ...recovered }));
       }
@@ -2231,7 +2351,7 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
     }, 10000);
 
     return () => clearTimeout(timer);
-  }, [screen, spotData, spotRetryTick, spots]);
+  }, [screen, spotData, spotRetryTick, spots, buoyByStation]);
 
   useEffect(() => {
     if (!activeSpot || spots.some(s => s.id === activeSpot.id)) return;
