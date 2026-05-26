@@ -5,6 +5,7 @@ import {
   anthropicMessagesBodyToOpenAI,
   applyConfiguredModel,
   getClaudeProviderStatus,
+  normalizeWorkersAiModelId,
   openAIChatCompletionToAnthropic,
   isModelNotFoundError,
   mapModelForGateway,
@@ -119,6 +120,17 @@ describe("preferWorkersAi", () => {
     );
   });
 
+  it("is true when Cloudflare creds and cf/ model without @ are set", () => {
+    assert.equal(
+      preferWorkersAi({
+        CLOUDFLARE_API_TOKEN: "t",
+        CLOUDFLARE_ACCOUNT_ID: "acc",
+        CLOUDFLARE_MODEL: "cf/meta/llama-3.1-70b-instruct",
+      }),
+      true
+    );
+  });
+
   it("is false when model is Claude", () => {
     assert.equal(
       preferWorkersAi({
@@ -137,6 +149,19 @@ describe("resolveCloudflareModel", () => {
       resolveCloudflareModel({ CLOUDFLARE_MODEL: "@cf/meta/llama-3.1-70b-instruct" }),
       "@cf/meta/llama-3.1-70b-instruct"
     );
+  });
+
+  it("adds @ when host stripped it from Workers AI model id", () => {
+    assert.equal(
+      resolveCloudflareModel({ CLOUDFLARE_MODEL: "cf/meta/llama-3.1-70b-instruct" }),
+      "@cf/meta/llama-3.1-70b-instruct"
+    );
+  });
+});
+
+describe("normalizeWorkersAiModelId", () => {
+  it("leaves claude ids unchanged", () => {
+    assert.equal(normalizeWorkersAiModelId("claude-haiku-4-5"), "claude-haiku-4-5");
   });
 });
 

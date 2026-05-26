@@ -10,9 +10,18 @@ import { anthropicProxyErrorMessage, fetchAnthropicWithRetry } from "./anthropic
 
 export const DEFAULT_CLOUDFLARE_GATEWAY_ID = "default";
 
+/** Normalize Workers AI ids — Vercel and some hosts strip a leading `@` from env values. */
+export const normalizeWorkersAiModelId = model => {
+  const id = String(model || "").trim();
+  if (!id) return id;
+  if (id.startsWith("@cf/")) return id;
+  if (id.startsWith("cf/")) return `@${id}`;
+  return id;
+};
+
 /** @param {Record<string, string | undefined>} [source] */
 export const resolveCloudflareModel = (source = process.env) =>
-  (source.CLOUDFLARE_MODEL || source.VITE_CLOUDFLARE_MODEL || "").trim();
+  normalizeWorkersAiModelId(source.CLOUDFLARE_MODEL || source.VITE_CLOUDFLARE_MODEL || "");
 
 export const isWorkersAiModel = model => String(model || "").trim().startsWith("@cf/");
 
@@ -26,7 +35,9 @@ export const preferWorkersAi = (source = process.env) => {
 /** @param {Record<string, string | undefined>} source */
 const buildWorkersAiFallbacks = source => {
   const primary = resolveCloudflareModel(source);
-  const secondary = (source.CLOUDFLARE_FALLBACK_MODEL || source.VITE_CLOUDFLARE_FALLBACK_MODEL || "").trim();
+  const secondary = normalizeWorkersAiModelId(
+    source.CLOUDFLARE_FALLBACK_MODEL || source.VITE_CLOUDFLARE_FALLBACK_MODEL || ""
+  );
   const chain = [];
   const seen = new Set();
   const add = m => {

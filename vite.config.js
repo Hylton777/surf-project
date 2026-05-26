@@ -6,9 +6,11 @@ import {
   claudeCredentialsMissingMessage,
   claudeProxyErrorMessage,
   getClaudeProviderStatus,
+  normalizeWorkersAiModelId,
   parseClaudeErrorMessage,
   proxyClaudeMessages,
   resolveClaudeCredentials,
+  resolveCloudflareModel,
 } from "./server/claude-upstream.mjs";
 import { fetchNdbcSpecUpstream } from "./server/ndbc-upstream.mjs";
 
@@ -46,10 +48,10 @@ export default defineConfig(({ mode }) => {
     if (merged.length) dns.setServers(merged);
   }
 
-  const cloudflareModel = (env.CLOUDFLARE_MODEL || env.VITE_CLOUDFLARE_MODEL || "").trim();
-  const cloudflareSpotModel = (
+  const cloudflareModel = resolveCloudflareModel(env);
+  const cloudflareSpotModel = normalizeWorkersAiModelId(
     env.CLOUDFLARE_SPOT_CONFIG_MODEL || env.VITE_CLOUDFLARE_SPOT_CONFIG_MODEL || cloudflareModel
-  ).trim();
+  );
 
   return {
     define: {

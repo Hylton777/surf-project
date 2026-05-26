@@ -75,8 +75,18 @@ const fmtSurfFt = ft => {
 };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+const normalizeWorkersAiModelId = model => {
+  const id = String(model || "").trim();
+  if (!id) return id;
+  if (id.startsWith("@cf/")) return id;
+  if (id.startsWith("cf/")) return `@${id}`;
+  return id;
+};
+
 const getAiModel = () =>
-  (import.meta.env.VITE_CLOUDFLARE_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "@cf/meta/llama-3.1-70b-instruct").trim();
+  normalizeWorkersAiModelId(
+    import.meta.env.VITE_CLOUDFLARE_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "@cf/meta/llama-3.1-70b-instruct"
+  );
 
 const getAiFallbackModel = () =>
   (import.meta.env.VITE_CLOUDFLARE_FALLBACK_MODEL || import.meta.env.VITE_ANTHROPIC_FALLBACK_MODEL || getAiModel()).trim();
