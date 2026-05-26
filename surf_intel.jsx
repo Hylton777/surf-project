@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { DEFAULT_NDBC_STATION_ID, DEFAULT_WEIGHTS, SPOT_CONFIGS, getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "./surfSpotConfigs";
 import { computeSurfScore } from "./src/surfScorer";
 import {
-  computeSurfHeightForecast,
+  computeHourlySurfForecast,
   marineHourFromArrays,
   roundHalfFt,
 } from "./src/surfForecast";
@@ -139,6 +139,7 @@ const getRatingDisplayColor = label => {
   const map = {
     Pumping: "#14532d",
     Good: "#16a34a",
+    Smooth: "#0d9488",
     Decent: "#f59e0b",
     Bad: "#f97316",
     Poor: "#dc2626",
@@ -239,6 +240,60 @@ const getNearestTideValue = tides => {
     if (!best || delta < best.delta) best = { delta, value: v };
   }
   return best ? best.value : null;
+};
+
+/** Linearly interpolate NOAA hilo predictions to feet MLLW at `ms`. */
+const getTideAtTime = (predictions, ms) => {
+  if (!Array.isArray(predictions) || !predictions.length || !Number.isFinite(ms)) return null;
+  const events = predictions
+    .map(p => ({ ts: new Date(p?.t).getTime(), v: Number(p?.v) }))
+    .filter(e => Number.isFinite(e.ts) && Number.isFinite(e.v))
+    .sort((a, b) => a.ts - b.ts);
+  if (!events.length) return null;
+  if (ms <= events[0].ts) return events[0].v;
+  if (ms >= events[events.length - 1].ts) return events[events.length - 1].v;
+  for (let i = 0; i < events.length - 1; i++) {
+    const a = events[i];
+    const b = events[i + 1];
+    if (ms >= a.ts && ms <= b.ts) {
+      const span = b.ts - a.ts;
+      if (span <= 0) return a.v;
+      const t = (ms - a.ts) / span;
+      return a.v + t * (b.v - a.v);
+    }
+  }
+  return null;
+};
+
+const parseHourTimeMs = s => {
+  const m = String(s || "").match(/(\d{4})-(\d{2})-(\d{2})[\sT](\d{2}):(\d{2})/);
+  if (!m) return NaN;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
+};
+
+const windHourAtIndex = (windJson, marineTimes, i) => {
+  const wi = alignHourIdx(marineTimes, windJson?.hourly?.time, i);
+  const speedMph = windJson?.hourly?.wind_speed_10m?.[wi];
+  const directionDeg = windJson?.hourly?.wind_direction_10m?.[wi];
+  return {
+    speedMph: Number.isFinite(Number(speedMph)) ? Number(speedMph) : null,
+    directionDeg: Number.isFinite(Number(directionDeg)) ? Number(directionDeg) : null,
+  };
+};
+
+const computeHourlySurfScore = (spotConfig, forecastPoint, windHour, tideFt) => {
+  const windSpeedKts = (Number(windHour?.speedMph) || 0) * MPH_TO_KNOTS;
+  return computeSurfScore(
+    {
+      swellHeight: forecastPoint.surfHeightFt,
+      swellPeriod: forecastPoint.swellPeriod,
+      swellDirection: forecastPoint.swellDir,
+      windSpeed: windSpeedKts,
+      windDirection: Number(windHour?.directionDeg) || 0,
+      tide: tideFt,
+    },
+    spotConfig
+  );
 };
 
 const parseDriveTimeMinutes = drive => {
@@ -498,28 +553,139 @@ const buoyObservationForBlend = obs =>
       }
     : null;
 
-const forecastHourAtIndex = (marineJson, spotConfig, buoyObservation, i) => {
+const forecastHourAtIndex = (
+  marineJson,
+  spotConfig,
+  buoyObservation,
+  windJson,
+  tidePredictions,
+  i,
+  anchor,
+  { useBuoyForBase = false } = {}
+) => {
   const marineHour = marineHourFromArrays(marineJson.hourly, i);
-  return computeSurfHeightForecast({ marineHour, spotConfig, buoyObservation });
+  const timeStr = marineJson.hourly.time?.[i];
+  const ms = parseHourTimeMs(timeStr);
+  const tideFt = getTideAtTime(tidePredictions, ms);
+  const windHour = windHourAtIndex(windJson, marineJson.hourly.time, i);
+  return computeHourlySurfForecast({
+    marineHour,
+    spotConfig,
+    windHour,
+    tideFt,
+    buoyObservation,
+    hourIndex: i,
+    anchor,
+    useBuoyForBase,
+  });
 };
 
-const buildSurfHeightSeries = (marineJson, spotConfig, buoyObservation, startIdx, count) => {
+const buildForecastHeightSeries = (
+  marineJson,
+  spotConfig,
+  buoyObservation,
+  windJson,
+  tidePredictions,
+  startIdx,
+  count,
+  anchor
+) => {
   const len = marineJson?.hourly?.time?.length || 0;
   const series = [];
   for (let i = startIdx; i < startIdx + count && i < len; i++) {
-    series.push(forecastHourAtIndex(marineJson, spotConfig, buoyObservation, i).surfHeightFt);
+    series.push(
+      forecastHourAtIndex(
+        marineJson,
+        spotConfig,
+        buoyObservation,
+        windJson,
+        tidePredictions,
+        i,
+        anchor
+      ).surfHeightFt
+    );
   }
   return series;
+};
+
+const buildDayForecastPoints = (
+  marineJson,
+  spotConfig,
+  buoyObservation,
+  windJson,
+  tidePredictions,
+  dayStartIdx,
+  dayTimes,
+  hi
+) => {
+  const anchorModel = forecastHourAtIndex(
+    marineJson,
+    spotConfig,
+    buoyObservation,
+    windJson,
+    tidePredictions,
+    hi,
+    null
+  );
+  const anchorBuoy = forecastHourAtIndex(
+    marineJson,
+    spotConfig,
+    buoyObservation,
+    windJson,
+    tidePredictions,
+    hi,
+    null,
+    { useBuoyForBase: true }
+  );
+  const anchor = {
+    index: hi,
+    surfHeightFt: anchorBuoy.surfHeightFt,
+    modelSurfHeightFt: anchorModel.surfHeightFt,
+  };
+
+  const points = [];
+  const len = marineJson?.hourly?.time?.length || 0;
+  for (let j = 0; j < dayTimes.length && dayStartIdx + j < len; j++) {
+    const i = dayStartIdx + j;
+    const time = dayTimes[j];
+    const ms = parseHourTimeMs(time);
+    const tideFt = getTideAtTime(tidePredictions, ms);
+    const windHour = windHourAtIndex(windJson, marineJson.hourly.time, i);
+    const forecast = forecastHourAtIndex(
+      marineJson,
+      spotConfig,
+      buoyObservation,
+      windJson,
+      tidePredictions,
+      i,
+      anchor
+    );
+    const { score, rating } = computeHourlySurfScore(spotConfig, forecast, windHour, tideFt);
+    points.push({
+      time,
+      ms: Number.isFinite(ms) ? ms : parseHourTimeMs(marineJson.hourly.time[i]),
+      surfHeightFt: forecast.surfHeightFt,
+      swellPeriod: forecast.swellPeriod,
+      swellDir: forecast.swellDir,
+      source: forecast.heightSource || forecast.source,
+      score,
+      rating,
+      windSpeedMph: forecast.windSpeedMph,
+      windClassification: forecast.windClassification,
+      tideFt: Number.isFinite(forecast.tideFt) ? forecast.tideFt : tideFt,
+    });
+  }
+  return { points, anchor, anchorBuoy };
 };
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const fetchMarine = (lat, lon) =>
-  fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,wave_peak_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_peak_period,swell_wave_direction,secondary_swell_wave_height,secondary_swell_wave_period,secondary_swell_wave_direction,wind_wave_height,wind_wave_period,wind_wave_peak_period,wind_wave_direction&forecast_days=2&timezone=America%2FLos_Angeles`)
+  fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,wave_peak_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_peak_period,swell_wave_direction,secondary_swell_wave_height,secondary_swell_wave_period,secondary_swell_wave_direction,wind_wave_height,wind_wave_period,wind_wave_peak_period,wind_wave_direction&past_days=1&forecast_days=2&timezone=America%2FLos_Angeles`)
     .then(r => r.json());
 
 const fetchWind = (lat, lon) =>
-  fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&forecast_days=2&timezone=America%2FLos_Angeles&wind_speed_unit=mph`)
+  fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&past_days=1&forecast_days=2&timezone=America%2FLos_Angeles&wind_speed_unit=mph`)
     .then(r => r.json());
 
 const fetchTides = stationId => {
@@ -727,7 +893,7 @@ const fetchMissingDriveTimes = async (spots, existingDriveTimes = {}, originInpu
   return fetchDriveTimes(missing, originInput);
 };
 
-const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}) => {
+const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}, tidePredictions = []) => {
   if (!marineJson?.hourly) return null;
   const spotConfig = getSpotScoringConfig(spot);
   if (!spotConfig) return null;
@@ -740,15 +906,37 @@ const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}) => {
   const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
 
   const hourlyTimes = marineJson.hourly.time || [];
-  const todayPrefix = (hourlyTimes[hi] || hourlyTimes[0] || "").slice(0, 10);
-  const dayStartIdx = todayPrefix
-    ? Math.max(0, hourlyTimes.findIndex(t => typeof t === "string" && t.startsWith(todayPrefix)))
-    : 0;
+  // Calendar-day window matching Open-Meteo timezone=America/Los_Angeles
+  const todayPrefix = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+  let dayStartIdx = hourlyTimes.findIndex(t => typeof t === "string" && t.startsWith(todayPrefix));
+  if (dayStartIdx < 0) {
+    // Fallback: roll forward/backward from current index to get a continuous 24h window
+    dayStartIdx = Math.max(0, Math.min(hi, Math.max(0, hourlyTimes.length - 24)));
+  }
   const dayTimes = hourlyTimes.slice(dayStartIdx, dayStartIdx + 24);
 
-  const currentForecast = forecastHourAtIndex(marineJson, spotConfig, buoyObservation, hi);
-  const daySurfHeights = buildSurfHeightSeries(marineJson, spotConfig, buoyObservation, dayStartIdx, 24);
-  const forecastSurf = buildSurfHeightSeries(marineJson, spotConfig, buoyObservation, hi, 12);
+  const { points: dayForecastPoints, anchor, anchorBuoy } = buildDayForecastPoints(
+    marineJson,
+    spotConfig,
+    buoyObservation,
+    windJson,
+    tidePredictions,
+    dayStartIdx,
+    dayTimes,
+    hi
+  );
+  const daySurfHeights = dayForecastPoints.map(p => p.surfHeightFt);
+  const currentForecast = anchorBuoy;
+  const forecastSurf = buildForecastHeightSeries(
+    marineJson,
+    spotConfig,
+    buoyObservation,
+    windJson,
+    tidePredictions,
+    hi,
+    12,
+    anchor
+  );
 
   return {
     waveHeight: marineJson.hourly.wave_height?.[hi] ?? 0,
@@ -773,6 +961,7 @@ const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}) => {
     dayTimes,
     dayWaveHeights: daySurfHeights,
     daySurfHeights,
+    dayForecastPoints,
   };
 };
 
@@ -984,7 +1173,14 @@ function TideChart({ tides, syncMs = null, onSyncHover }) {
         </defs>
         <g clipPath="url(#tideClip)">
           <path d={path + ` L ${cps[cps.length - 1].x},${H - padBot} L ${cps[0].x},${H - padBot} Z`} fill="url(#tg)" />
-          <path d={path} fill="none" stroke={THEME.accent} strokeWidth="1.5" />
+          <path
+            d={path}
+            fill="none"
+            stroke={THEME.accent}
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
           {[0.25, 0.5, 0.75].map(f => (
             <line
               key={f}
@@ -1098,32 +1294,47 @@ function TideChart({ tides, syncMs = null, onSyncHover }) {
   );
 }
 
-function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
+const formatForecastSourceLabel = source => {
+  const s = String(source || "model");
+  if (s === "blend" || s === "buoy") return "NDBC blend";
+  if (s === "model+anchor") return "model + buoy anchor";
+  return "model";
+};
+
+function WaveForecastChart({ points: richPoints, times, heights, syncMs = null, onSyncHover }) {
   const [hover, setHover] = useState(null);
 
-  if (!times?.length || !heights?.length) {
-    return <p style={{ color: THEME.textSoft, fontSize: 12 }}>No forecast available.</p>;
-  }
-
-  const parseHourTime = s => {
-    const m = String(s || "").match(/(\d{4})-(\d{2})-(\d{2})[\sT](\d{2}):(\d{2})/);
-    if (!m) return NaN;
-    return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
-  };
   const fmtHM = ms => {
     const d = new Date(ms);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   };
 
-  const points = times
-    .map((t, i) => ({ t, ms: parseHourTime(t), heightFt: Number(heights[i]) }))
-    .filter(p => Number.isFinite(p.ms) && Number.isFinite(p.heightFt));
+  const points = (richPoints?.length
+    ? richPoints.map(p => ({
+        t: p.time,
+        ms: Number(p.ms),
+        heightFt: Number(p.surfHeightFt),
+        rating: p.rating,
+        score: p.score,
+        swellPeriod: p.swellPeriod,
+        swellDir: p.swellDir,
+        windSpeedMph: p.windSpeedMph,
+        windClassification: p.windClassification,
+        tideFt: p.tideFt,
+        source: p.source,
+      }))
+    : (times || []).map((t, i) => ({
+        t,
+        ms: parseHourTimeMs(t),
+        heightFt: Number(heights?.[i]),
+      }))
+  ).filter(p => Number.isFinite(p.ms) && Number.isFinite(p.heightFt));
 
   if (!points.length) {
     return <p style={{ color: THEME.textSoft, fontSize: 12 }}>No forecast available.</p>;
   }
 
-  const dateStr = points[0].t.slice(0, 10);
+  const dateStr = String(points[0].t || "").slice(0, 10);
   const dateParts = dateStr.match(/(\d{4})-(\d{2})-(\d{2})/);
   const start = dateParts
     ? new Date(+dateParts[1], +dateParts[2] - 1, +dateParts[3]).getTime()
@@ -1149,6 +1360,17 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
 
   const cps = inWindow.map(p => ({ ...p, x: xFor(p.ms), y: yFor(p.heightFt) }));
 
+  const segmentPaths = [];
+  for (let i = 0; i < cps.length - 1; i++) {
+    const x0 = cps[i].x, y0 = cps[i].y;
+    const x1 = cps[i + 1].x, y1 = cps[i + 1].y;
+    const cx = (x0 + x1) / 2;
+    segmentPaths.push({
+      d: `M ${x0},${y0} C ${cx},${y0} ${cx},${y1} ${x1},${y1}`,
+      color: getRatingDisplayColor(cps[i].rating || cps[i + 1].rating),
+    });
+  }
+
   let path = `M ${cps[0].x},${cps[0].y}`;
   for (let i = 1; i < cps.length; i++) {
     const x0 = cps[i - 1].x, y0 = cps[i - 1].y;
@@ -1156,6 +1378,19 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
     const cx = (x0 + x1) / 2;
     path += ` C ${cx},${y0} ${cx},${y1} ${x1},${y1}`;
   }
+
+  const nearestPointAtMs = ms => {
+    let best = inWindow[0];
+    let bestDelta = Math.abs(best.ms - ms);
+    for (const p of inWindow) {
+      const d = Math.abs(p.ms - ms);
+      if (d < bestDelta) {
+        best = p;
+        bestDelta = d;
+      }
+    }
+    return best;
+  };
 
   const samples = [];
   for (let i = 1; i < cps.length; i++) {
@@ -1201,7 +1436,7 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
     const s = sampleAtX(px);
     if (!s) return;
     const ms = timeFromX(px);
-    setHover({ x: px, y: s.y, value: valueFromY(s.y), ms });
+    setHover({ x: px, y: s.y, value: valueFromY(s.y), ms, point: nearestPointAtMs(ms) });
     if (onSyncHover) onSyncHover(ms);
   };
 
@@ -1217,13 +1452,17 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
     const px = Math.min(Math.max(xFor(syncMs), padX), W - padX);
     const s = sampleAtX(px);
     if (!s) return null;
-    return { x: px, y: s.y, value: valueFromY(s.y), ms: syncMs };
+    return { x: px, y: s.y, value: valueFromY(s.y), ms: syncMs, point: nearestPointAtMs(syncMs) };
   })();
   const effectiveHover = hover || remoteHover;
 
   const peak = cps.reduce((best, p) => (p.heightFt > best.heightFt ? p : best), cps[0]);
   const ticks = ["00:00", "06:00", "12:00", "18:00", "00:00"];
-  const tooltipW = 64, tooltipH = 26, tooltipGap = 8;
+  const hp = effectiveHover?.point;
+  const hasRichTooltip = hp && (hp.rating || hp.swellPeriod);
+  const tooltipW = hasRichTooltip ? 148 : 64;
+  const tooltipH = hasRichTooltip ? 78 : 26;
+  const tooltipGap = 8;
   const tooltipX = effectiveHover
     ? Math.min(Math.max(effectiveHover.x - tooltipW / 2, 2), W - tooltipW - 2)
     : 0;
@@ -1251,7 +1490,28 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
         </defs>
         <g clipPath="url(#waveClip)">
           <path d={path + ` L ${cps[cps.length - 1].x},${H - padBot} L ${cps[0].x},${H - padBot} Z`} fill="url(#wfg)" />
-          <path d={path} fill="none" stroke={THEME.accent} strokeWidth="1.5" />
+          {segmentPaths.length
+            ? segmentPaths.map((seg, idx) => (
+                <path
+                  key={`seg-${idx}`}
+                  d={seg.d}
+                  fill="none"
+                  stroke={seg.color || THEME.accent}
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              ))
+            : (
+              <path
+                d={path}
+                fill="none"
+                stroke={THEME.accent}
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            )}
           {[0.25, 0.5, 0.75].map(f => (
             <line
               key={f}
@@ -1331,18 +1591,52 @@ function WaveForecastChart({ times, heights, syncMs = null, onSyncHover }) {
               fontFamily="'Space Mono', monospace"
             >
               {fmtHM(effectiveHover.ms)}
+              {hasRichTooltip ? ` · ${fmtSurfFt(effectiveHover.value)}ft` : ""}
             </text>
-            <text
-              x={tooltipX + tooltipW / 2}
-              y={tooltipY + 21}
-              textAnchor="middle"
-              fontSize="9"
-              fill={THEME.accent}
-              fontFamily="'Space Mono', monospace"
-              fontWeight="700"
-            >
-              {fmtSurfFt(effectiveHover.value)}ft
-            </text>
+            {!hasRichTooltip && (
+              <text
+                x={tooltipX + tooltipW / 2}
+                y={tooltipY + 21}
+                textAnchor="middle"
+                fontSize="9"
+                fill={THEME.accent}
+                fontFamily="'Space Mono', monospace"
+                fontWeight="700"
+              >
+                {fmtSurfFt(effectiveHover.value)}ft
+              </text>
+            )}
+            {hasRichTooltip && (
+              <>
+                <text
+                  x={tooltipX + tooltipW / 2}
+                  y={tooltipY + 22}
+                  textAnchor="middle"
+                  fontSize="8"
+                  fill={getRatingDisplayColor(hp.rating)}
+                  fontFamily="'Space Mono', monospace"
+                  fontWeight="700"
+                >
+                  {hp.rating || "—"} {Number.isFinite(hp.score) ? `(${Math.round(hp.score)})` : ""}
+                </text>
+                <text x={tooltipX + tooltipW / 2} y={tooltipY + 34} textAnchor="middle" fontSize="7" fill={THEME.textSoft}>
+                  {Number.isFinite(hp.swellPeriod) ? `${hp.swellPeriod.toFixed(0)}s` : "—"} swell{" "}
+                  {Number.isFinite(hp.swellDir) ? degToCompass(hp.swellDir) : ""}
+                </text>
+                <text x={tooltipX + tooltipW / 2} y={tooltipY + 46} textAnchor="middle" fontSize="7" fill={THEME.textSoft}>
+                  wind{" "}
+                  {Number.isFinite(hp.windSpeedMph) ? `${hp.windSpeedMph.toFixed(0)}mph` : "—"}{" "}
+                  {hp.windClassification || ""}
+                </text>
+                <text x={tooltipX + tooltipW / 2} y={tooltipY + 58} textAnchor="middle" fontSize="7" fill={THEME.textSoft}>
+                  tide {Number.isFinite(hp.tideFt) ? `${hp.tideFt.toFixed(1)}ft` : "—"} ·{" "}
+                  {formatForecastSourceLabel(hp.source)}
+                </text>
+                <text x={tooltipX + tooltipW / 2} y={tooltipY + 70} textAnchor="middle" fontSize="6" fill={THEME.muted}>
+                  period/dir from marine model
+                </text>
+              </>
+            )}
           </g>
         )}
         {ticks.map((t, i) => (
@@ -1862,7 +2156,9 @@ function Dashboard({
                     value: `${fmtSurfFt(data.surfHeightFt)}ft`,
                     sub: [
                       data.swellPeriod ? `${data.swellPeriod.toFixed(0)}s period` : "",
-                      data.forecastSource === "blend" ? `NDBC ${data.ndbcStationId} blend` : "",
+                      data.forecastSource === "blend" || data.forecastSource === "buoy"
+                        ? `NDBC blend (now) · ${data.ndbcStationId}`
+                        : "",
                     ].filter(Boolean).join(" · "),
                   },
                   { label: "SWELL DIR", value: degToCompass(data.swellDir), sub: `${Math.round(data.swellDir || 0)}° bearing` },
@@ -1901,8 +2197,12 @@ function Dashboard({
 
               {/* 24-hr wave forecast (full width) */}
               <div style={{ background: THEME.panel, borderRadius: 8, padding: "13px 16px", border: `1px solid ${THEME.border}`, marginBottom: 16 }}>
-                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 14 }}>24-HR SURF FORECAST (FACE HEIGHT)</div>
+                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 6 }}>24-HR SURF FORECAST (FACE HEIGHT)</div>
+                <div style={{ fontSize: 10, color: THEME.textSoft, marginBottom: 12 }}>
+                  Hourly model + wind; now uses NDBC when available
+                </div>
                 <WaveForecastChart
+                  points={data.dayForecastPoints}
                   times={data.dayTimes}
                   heights={data.daySurfHeights ?? data.dayWaveHeights}
                   syncMs={syncMs}
@@ -1989,8 +2289,9 @@ function Dashboard({
           <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${THEME.border}` }}>
             <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.textSoft, marginBottom: 12 }}>CONDITION KEY</div>
             {[
-              { label: "Pumping", color: getRatingDisplayColor("Pumping"), desc: "Powerful, high-quality surf" },
-              { label: "Good", color: getRatingDisplayColor("Good"), desc: "Consistently quality waves" },
+              { label: "Pumping", color: getRatingDisplayColor("Pumping"), desc: "6 ft+ face, high-quality surf" },
+              { label: "Good", color: getRatingDisplayColor("Good"), desc: "4 ft+ face, consistently quality waves" },
+              { label: "Smooth", color: getRatingDisplayColor("Smooth"), desc: "Clean conditions, smaller surf (under 4 ft face)" },
               { label: "Decent", color: getRatingDisplayColor("Decent"), desc: "Rideable with some tradeoffs" },
               { label: "Bad", color: getRatingDisplayColor("Bad"), desc: "Marginal and inconsistent" },
               { label: "Poor", color: getRatingDisplayColor("Poor"), desc: "Unfavorable surf conditions" },
@@ -2216,7 +2517,13 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
 
       const data = {};
       spots.forEach((spot, i) => {
-        data[spot.id] = buildSpotCondition(spot, marines[i], winds[i], nextBuoyByStation);
+        data[spot.id] = buildSpotCondition(
+          spot,
+          marines[i],
+          winds[i],
+          nextBuoyByStation,
+          nextTidesByStation[spot.tideStationId] || []
+        );
       });
 
       setSpotData(data);

@@ -1,6 +1,10 @@
 /**
  * SURF SPOT CONFIGURATIONS — BAY AREA
  *
+ * Calibration: run `node scripts/calibrate-forecast.mjs` to compare model-only vs NDBC
+ * at the current hour. Adjust `surf_height_scale` when |model vs buoy| bias stays > ~15%.
+ * Last pass: scales left unchanged (OB 0.48 tracks buoy blend; beach breaks ~0.54–0.56).
+ *
  * Used to score surf conditions at each spot on a 0–100 scale.
  * Feed hourly forecast data (swell height, period, direction, wind speed,
  * wind direction, tide) into your scoring engine alongside these configs.

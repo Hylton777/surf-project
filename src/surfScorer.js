@@ -1,5 +1,8 @@
 import { DEFAULT_WEIGHTS } from "../surfSpotConfigs.js";
 import { getDirectionScore } from "./swellDirection.js";
+import { classifyWind } from "./wind.js";
+
+export { classifyWind };
 
 const COMPONENT_KEYS = ["height", "period", "direction", "wind", "tide"];
 
@@ -53,15 +56,6 @@ export const getPeriodDeficitMultiplier = (period, minPeriod) => {
   if (deficit <= 2) return 0.7;
   if (deficit <= 4) return 0.5;
   return 0.3;
-};
-
-const classifyWind = (windDirection, breakFacingDirection) => {
-  if (!Number.isFinite(windDirection) || !Number.isFinite(breakFacingDirection)) return "cross-shore";
-  let windAngle = (windDirection - breakFacingDirection + 360) % 360;
-  if (windAngle > 180) windAngle -= 360;
-  if (Math.abs(windAngle - 180) <= 30 || Math.abs(windAngle + 180) <= 30) return "offshore";
-  if (Math.abs(windAngle) <= 30) return "onshore";
-  return "cross-shore";
 };
 
 const getWindScore = (windSpeed, windClassification) => {
@@ -166,12 +160,26 @@ const applyHardOverrides = (score, rating, breakdown, conditions, spotConfig) =>
   return { score: nextScore, rating: nextRating };
 };
 
+export const FACE_HEIGHT_GOOD_FT = 4;
+export const FACE_HEIGHT_PUMPING_FT = 6;
+
 export const getRatingFromScore = score => {
   if (score >= 85) return "Pumping";
   if (score >= 65) return "Good";
   if (score >= 45) return "Decent";
   if (score >= 25) return "Bad";
   return "Poor";
+};
+
+/** Map score-tier Good/Pumping to display labels using face height (ft). */
+export const getDisplayRating = (scoreRating, swellHeightFt) => {
+  if (scoreRating !== "Good" && scoreRating !== "Pumping") return scoreRating;
+  if (swellHeightFt == null || swellHeightFt === "") return scoreRating;
+  const ft = Number(swellHeightFt);
+  if (!Number.isFinite(ft)) return scoreRating;
+  if (scoreRating === "Pumping" && ft >= FACE_HEIGHT_PUMPING_FT) return "Pumping";
+  if (ft >= FACE_HEIGHT_GOOD_FT) return "Good";
+  return "Smooth";
 };
 
 export function computeSurfScore(conditions, spotConfig) {
@@ -214,7 +222,7 @@ export function computeSurfScore(conditions, spotConfig) {
 
   return {
     score: overridden.score,
-    rating: overridden.rating,
+    rating: getDisplayRating(overridden.rating, conditions.swellHeight),
     breakdown,
   };
 }

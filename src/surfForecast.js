@@ -1,4 +1,13 @@
+import {
+  BUOY_ANCHOR_DECAY_HOURS,
+  BUOY_RATIO_CLAMP,
+  CROSSSHORE_CHOP_TIERS,
+  ONSHORE_CHOP_TIERS,
+  TIDE_HEIGHT_MULT_MAX,
+  TIDE_HEIGHT_MULT_MIN,
+} from "./forecastTuning.js";
 import { getDirectionAttenuation, getDirectionScore } from "./swellDirection.js";
+import { classifyWind } from "./wind.js";
 import { getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "../surfSpotConfigs.js";
 
 export const M_TO_FT = 3.28084;
@@ -365,6 +374,174 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
     displayPeriod,
     swellDir,
     directionScore: swellDir != null ? getDirectionScore(swellDir, spotConfig) : 0,
+  };
+}
+
+const chopMultiplierFromTiers = (speedMph, tiers) => {
+  const mph = Number(speedMph);
+  if (!Number.isFinite(mph) || mph <= 0) return 1;
+  for (const tier of tiers) {
+    if (mph <= tier.maxMph) return tier.mult;
+  }
+  return tiers[tiers.length - 1]?.mult ?? 1;
+};
+
+/**
+ * Mild face-height reduction for onshore / cross-shore wind chop.
+ * @param {number} surfHeightFt
+ * @param {number} windSpeedMph
+ * @param {number} windDir
+ * @param {object} spotConfig
+ */
+export const applyWindChopFactor = (surfHeightFt, windSpeedMph, windDir, spotConfig) => {
+  const ft = Number(surfHeightFt);
+  if (!Number.isFinite(ft) || ft <= 0) return ft;
+  const facing = Number(spotConfig?.break_facing_direction);
+  const classification = classifyWind(windDir, facing);
+  let mult = 1;
+  if (classification === "onshore") {
+    mult = chopMultiplierFromTiers(windSpeedMph, ONSHORE_CHOP_TIERS);
+  } else if (classification === "cross-shore") {
+    mult = chopMultiplierFromTiers(windSpeedMph, CROSSSHORE_CHOP_TIERS);
+  }
+  return roundHalfFt(ft * mult);
+};
+
+/**
+ * Subtle height multiplier for tide-sensitive spots (score still carries main tide signal).
+ * @param {number} surfHeightFt
+ * @param {number | null} tideFt MLLW
+ * @param {object} spotConfig
+ */
+export const applyTideHeightFactor = (surfHeightFt, tideFt, spotConfig) => {
+  const ft = Number(surfHeightFt);
+  if (!Number.isFinite(ft) || ft <= 0) return ft;
+  const pref = String(spotConfig?.tide_preference || "any").toLowerCase();
+  if (pref === "any") return ft;
+  const range = spotConfig?.optimal_tide_range_ft;
+  if (!Array.isArray(range) || range.length < 2) return ft;
+  const tide = Number(tideFt);
+  if (!Number.isFinite(tide)) return ft;
+  const minT = Math.min(Number(range[0]), Number(range[1]));
+  const maxT = Math.max(Number(range[0]), Number(range[1]));
+  if (!Number.isFinite(minT) || !Number.isFinite(maxT)) return ft;
+
+  if (tide >= minT && tide <= maxT) return ft;
+  const distanceOutside = tide < minT ? minT - tide : tide - maxT;
+  let mult = TIDE_HEIGHT_MULT_MAX;
+  if (distanceOutside <= 0.5) mult = 0.97;
+  else if (distanceOutside <= 1) mult = 0.94;
+  else mult = TIDE_HEIGHT_MULT_MIN;
+  return roundHalfFt(ft * mult);
+};
+
+/**
+ * Pull hourly model height toward buoy-anchored "now" with linear decay (past hours unchanged).
+ */
+export const applyBuoyAnchorCorrection = ({
+  modelSurfHeightFt,
+  hourIndex,
+  anchorIndex,
+  anchorSurfHeightFt,
+  modelSurfHeightAtAnchor,
+  decayHours = BUOY_ANCHOR_DECAY_HOURS,
+}) => {
+  const modelFt = Number(modelSurfHeightFt);
+  const anchorFt = Number(anchorSurfHeightFt);
+  const modelAtAnchor = Number(modelSurfHeightAtAnchor);
+  const hi = Number(anchorIndex);
+  const i = Number(hourIndex);
+
+  if (
+    !Number.isFinite(modelFt) ||
+    !Number.isFinite(anchorFt) ||
+    !Number.isFinite(modelAtAnchor) ||
+    modelAtAnchor <= 0 ||
+    !Number.isFinite(hi) ||
+    !Number.isFinite(i)
+  ) {
+    return modelFt;
+  }
+
+  if (i < hi) return modelFt;
+
+  const [ratioMin, ratioMax] = BUOY_RATIO_CLAMP;
+  const ratio = clamp(anchorFt / modelAtAnchor, ratioMin, ratioMax);
+  const hoursFromAnchor = Math.abs(i - hi);
+  const weight = Math.max(0, 1 - hoursFromAnchor / decayHours);
+  if (weight <= 0) return modelFt;
+
+  return roundHalfFt(modelFt * (1 + weight * (ratio - 1)));
+};
+
+/**
+ * Full hourly pipeline: model swell → wind chop → tide → optional buoy anchor decay.
+ * @param {{
+ *   marineHour: object,
+ *   spotConfig: object,
+ *   windHour?: { speedMph?: number, directionDeg?: number } | null,
+ *   tideFt?: number | null,
+ *   buoyObservation?: object | null,
+ *   hourIndex: number,
+ *   anchor?: { index: number, surfHeightFt: number, modelSurfHeightFt: number } | null,
+ *   useBuoyForBase?: boolean,
+ * }} args
+ */
+export function computeHourlySurfForecast({
+  marineHour,
+  spotConfig,
+  windHour = null,
+  tideFt = null,
+  buoyObservation = null,
+  hourIndex,
+  anchor = null,
+  useBuoyForBase = false,
+}) {
+  const useBuoy = useBuoyForBase && hourIndex === anchor?.index;
+  const base = computeSurfHeightForecast({
+    marineHour,
+    spotConfig,
+    buoyObservation: useBuoy ? buoyObservation : null,
+  });
+
+  let surfHeightFt = base.surfHeightFt;
+  const windSpeedMph = Number(windHour?.speedMph);
+  const windDir = Number(windHour?.directionDeg);
+  if (Number.isFinite(windSpeedMph) && Number.isFinite(windDir)) {
+    surfHeightFt = applyWindChopFactor(surfHeightFt, windSpeedMph, windDir, spotConfig);
+  }
+  surfHeightFt = applyTideHeightFactor(surfHeightFt, tideFt, spotConfig);
+
+  let heightSource = useBuoy ? base.source : "model";
+  if (anchor && Number.isFinite(anchor.surfHeightFt) && Number.isFinite(anchor.modelSurfHeightFt)) {
+    const beforeAnchor = surfHeightFt;
+    surfHeightFt = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: surfHeightFt,
+      hourIndex,
+      anchorIndex: anchor.index,
+      anchorSurfHeightFt: anchor.surfHeightFt,
+      modelSurfHeightAtAnchor: anchor.modelSurfHeightFt,
+    });
+    if (hourIndex === anchor.index) {
+      surfHeightFt = anchor.surfHeightFt;
+      heightSource = base.source;
+    } else if (surfHeightFt !== beforeAnchor) {
+      heightSource = hourIndex > anchor.index ? "model+anchor" : "model";
+    }
+  }
+
+  const windClassification = Number.isFinite(windDir)
+    ? classifyWind(windDir, spotConfig?.break_facing_direction)
+    : "cross-shore";
+
+  return {
+    ...base,
+    surfHeightFt,
+    descriptor: faceHeightToDescriptor(surfHeightFt),
+    heightSource,
+    windSpeedMph: Number.isFinite(windSpeedMph) ? windSpeedMph : null,
+    windClassification,
+    tideFt: Number.isFinite(Number(tideFt)) ? Number(tideFt) : null,
   };
 }
 

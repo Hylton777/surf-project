@@ -3,8 +3,11 @@ import { describe, it } from "node:test";
 import { SPOT_CONFIGS } from "../surfSpotConfigs.js";
 import {
   adjustSurfPeriod,
+  applyBuoyAnchorCorrection,
+  applyWindChopFactor,
   blendWithBuoy,
   buoyToSwellComponent,
+  computeHourlySurfForecast,
   computeSurfHeightForecast,
   faceHeightToDescriptor,
   getEffectiveSwellHsM,
@@ -197,6 +200,31 @@ describe("computeSurfHeightForecast", () => {
     assert.ok(["blend", "buoy"].includes(blended.source));
     assert.ok(blended.surfHeightFt !== modelOnly.surfHeightFt || blended.swellHsFt !== modelOnly.swellHsFt);
   });
+
+  it("reusing the same buoy on every hour flattens a time series", () => {
+    const buoy = { hsM: 1.5, swellHsM: 1.1, periodS: 17, directionDeg: 306, ageMinutes: 30 };
+    const blockedModelHours = [
+      { swellHeight: 0.4, swellPeriod: 10, swellDir: 180 },
+      { swellHeight: 0.5, swellPeriod: 11, swellDir: 200 },
+      { swellHeight: 0.6, swellPeriod: 12, swellDir: 210 },
+    ];
+    const withBuoy = blockedModelHours.map(marineHour =>
+      computeSurfHeightForecast({ marineHour, spotConfig: oceanBeach, buoyObservation: buoy }).surfHeightFt
+    );
+    assert.equal(new Set(withBuoy).size, 1);
+  });
+
+  it("model-only hourly forecasts vary with changing marine input", () => {
+    const varyingModelHours = [
+      { swellHeight: 0.8, swellPeriod: 12, swellDir: 300 },
+      { swellHeight: 1.5, swellPeriod: 14, swellDir: 310 },
+      { swellHeight: 2.2, swellPeriod: 16, swellDir: 305 },
+    ];
+    const modelOnly = varyingModelHours.map(marineHour =>
+      computeSurfHeightForecast({ marineHour, spotConfig: oceanBeach, buoyObservation: null }).surfHeightFt
+    );
+    assert.ok(new Set(modelOnly).size > 1);
+  });
 });
 
 describe("adjustSurfPeriod", () => {
@@ -223,5 +251,112 @@ describe("faceHeightToDescriptor", () => {
     assert.equal(faceHeightToDescriptor(0.5), "ankle-shin");
     assert.equal(faceHeightToDescriptor(3.5), "chest-shoulder");
     assert.equal(faceHeightToDescriptor(5.5), "1 ft overhead");
+  });
+});
+
+describe("applyBuoyAnchorCorrection", () => {
+  it("matches anchor at hi when ratio is within clamp and decays by hi+12", () => {
+    const anchorFt = 3;
+    const modelAtAnchor = 2;
+    const atHi = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: 2,
+      hourIndex: 6,
+      anchorIndex: 6,
+      anchorSurfHeightFt: anchorFt,
+      modelSurfHeightAtAnchor: modelAtAnchor,
+    });
+    assert.equal(atHi, anchorFt);
+
+    const plus3 = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: 3,
+      hourIndex: 9,
+      anchorIndex: 6,
+      anchorSurfHeightFt: anchorFt,
+      modelSurfHeightAtAnchor: modelAtAnchor,
+    });
+    assert.ok(plus3 >= 3);
+    assert.notEqual(plus3, 3);
+
+    const plus6 = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: 3,
+      hourIndex: 12,
+      anchorIndex: 6,
+      anchorSurfHeightFt: anchorFt,
+      modelSurfHeightAtAnchor: modelAtAnchor,
+    });
+    assert.equal(plus6, 3);
+
+    const plus12 = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: 3,
+      hourIndex: 18,
+      anchorIndex: 6,
+      anchorSurfHeightFt: anchorFt,
+      modelSurfHeightAtAnchor: modelAtAnchor,
+    });
+    assert.equal(plus12, 3);
+  });
+
+  it("does not correct past hours", () => {
+    const corrected = applyBuoyAnchorCorrection({
+      modelSurfHeightFt: 3,
+      hourIndex: 2,
+      anchorIndex: 6,
+      anchorSurfHeightFt: 5,
+      modelSurfHeightAtAnchor: 2,
+    });
+    assert.equal(corrected, 3);
+  });
+});
+
+describe("applyWindChopFactor", () => {
+  it("reduces height more for onshore than offshore", () => {
+    const facing = oceanBeach.break_facing_direction;
+    const offshore = applyWindChopFactor(4, 18, facing + 180, oceanBeach);
+    const onshore = applyWindChopFactor(4, 18, facing, oceanBeach);
+    assert.equal(offshore, 4);
+    assert.ok(onshore < offshore);
+  });
+});
+
+describe("computeHourlySurfForecast pipeline", () => {
+  it("keeps varying heights after anchor on a ramping marine series", () => {
+    const marineHours = [
+      { swellHeight: 0.8, swellPeriod: 12, swellDir: 300 },
+      { swellHeight: 1.2, swellPeriod: 13, swellDir: 305 },
+      { swellHeight: 1.6, swellPeriod: 14, swellDir: 310 },
+      { swellHeight: 2.0, swellPeriod: 15, swellDir: 315 },
+    ];
+    const buoy = { hsM: 1.5, swellHsM: 1.2, periodS: 14, directionDeg: 300, ageMinutes: 30 };
+    const hi = 1;
+    const modelAtHi = computeHourlySurfForecast({
+      marineHour: marineHours[hi],
+      spotConfig: oceanBeach,
+      hourIndex: hi,
+      windHour: { speedMph: 8, directionDeg: oceanBeach.break_facing_direction + 180 },
+    });
+    const anchorAtHi = computeHourlySurfForecast({
+      marineHour: marineHours[hi],
+      spotConfig: oceanBeach,
+      buoyObservation: buoy,
+      hourIndex: hi,
+      useBuoyForBase: true,
+      windHour: { speedMph: 8, directionDeg: oceanBeach.break_facing_direction + 180 },
+    });
+    const anchor = {
+      index: hi,
+      surfHeightFt: anchorAtHi.surfHeightFt,
+      modelSurfHeightFt: modelAtHi.surfHeightFt,
+    };
+    const series = marineHours.map((marineHour, i) =>
+      computeHourlySurfForecast({
+        marineHour,
+        spotConfig: oceanBeach,
+        hourIndex: i,
+        anchor,
+        windHour: { speedMph: 8, directionDeg: oceanBeach.break_facing_direction + 180 },
+      }).surfHeightFt
+    );
+    assert.ok(new Set(series).size > 1);
+    assert.equal(series[hi], anchor.surfHeightFt);
   });
 });
