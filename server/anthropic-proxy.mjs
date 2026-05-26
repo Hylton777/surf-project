@@ -2,7 +2,8 @@
  * Standalone Anthropic proxy for `npm run preview` or any static host
  * that can run a small Node process alongside the build.
  *
- * Usage: ANTHROPIC_API_KEY=sk-ant-... node server/anthropic-proxy.mjs
+ * Usage: CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... node server/anthropic-proxy.mjs
+ *    or: ANTHROPIC_API_KEY=sk-ant-... node server/anthropic-proxy.mjs
  * Default listen: http://127.0.0.1:8787
  *
  * Then: VITE_ANTHROPIC_PROXY_URL=http://127.0.0.1:8787/v1/messages npm run preview
@@ -13,7 +14,11 @@ import dns from "node:dns";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { fetchAnthropicWithRetry } from "./anthropic-upstream.mjs";
+import {
+  claudeCredentialsMissingMessage,
+  proxyClaudeMessages,
+  resolveClaudeCredentials,
+} from "./claude-upstream.mjs";
 import { fetchNdbcSpecUpstream } from "./ndbc-upstream.mjs";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -32,25 +37,27 @@ dns.setDefaultResultOrder("ipv4first");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, "..");
 
-function readKeyFromEnvFiles() {
-  if (process.env.ANTHROPIC_API_KEY?.trim()) return process.env.ANTHROPIC_API_KEY.trim();
+function loadEnvFromFiles() {
+  const merged = { ...process.env };
   for (const name of [".env.local", ".env"]) {
     const p = path.join(root, name);
     if (!fs.existsSync(p)) continue;
     const text = fs.readFileSync(p, "utf8");
     for (const line of text.split("\n")) {
-      const m = line.match(/^\s*ANTHROPIC_API_KEY\s*=\s*(.+)\s*$/);
-      if (m) return m[1].replace(/^["']|["']$/g, "").trim();
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!m || m[1].startsWith("#")) continue;
+      merged[m[1]] = m[2].replace(/^["']|["']$/g, "").trim();
     }
   }
-  return "";
+  return merged;
 }
 
-const API_KEY = readKeyFromEnvFiles();
+const env = loadEnvFromFiles();
+const creds = resolveClaudeCredentials(env);
 const PORT = Number(process.env.ANTHROPIC_PROXY_PORT || 8787);
 
-if (!API_KEY) {
-  console.error("Missing ANTHROPIC_API_KEY (env or .env.local). Exiting.");
+if (!creds) {
+  console.error(claudeCredentialsMissingMessage());
   process.exit(1);
 }
 
@@ -92,19 +99,7 @@ const server = http.createServer(async (req, res) => {
   const body = Buffer.concat(chunks).toString("utf8");
 
   try {
-    const r = await fetchAnthropicWithRetry(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": API_KEY,
-          "anthropic-version": "2023-06-01",
-        },
-        body,
-      },
-      3
-    );
+    const r = await proxyClaudeMessages(body, env, 3);
     const buf = Buffer.from(await r.arrayBuffer());
     res.writeHead(r.status, { "Content-Type": r.headers.get("content-type") || "application/json" });
     res.end(buf);
@@ -115,5 +110,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Anthropic proxy listening on http://127.0.0.1:${PORT} (POST /v1/messages)`);
+  console.log(
+    `Claude proxy (${creds.provider}) listening on http://127.0.0.1:${PORT} (POST /v1/messages)`
+  );
 });

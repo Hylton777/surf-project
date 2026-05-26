@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "preview:ai": "node server/anthropic-proxy.mjs & vite preview",
     "proxy:anthropic": "node server/anthropic-proxy.mjs",
-    "test": "node --test src/surfScorer.test.js src/surfForecast.test.js src/ndbcSpecParser.test.js"
+    "test": "node --test src/surfScorer.test.js src/surfForecast.test.js src/ndbcSpecParser.test.js server/claude-upstream.test.js"
   },
   "dependencies": {
     "react": "^18.3.1",

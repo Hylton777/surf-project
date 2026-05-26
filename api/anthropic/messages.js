@@ -1,9 +1,17 @@
 /**
  * Vercel Serverless Function: same path as Vite dev proxy (`POST /api/anthropic/messages`).
- * Set `ANTHROPIC_API_KEY` in the Vercel project (Sensitive). Do not use the `VITE_` prefix for the key.
+ * Credentials (server-side, no VITE_ prefix):
+ *   - CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (preferred)
+ *   - optional CLOUDFLARE_AI_GATEWAY_ID
+ *   - or ANTHROPIC_API_KEY (legacy direct Anthropic)
  */
 import dns from "node:dns";
-import { anthropicProxyErrorMessage, fetchAnthropicWithRetry } from "../../server/anthropic-upstream.mjs";
+import {
+  claudeCredentialsMissingMessage,
+  claudeProxyErrorMessage,
+  proxyClaudeMessages,
+  resolveClaudeCredentials,
+} from "../../server/claude-upstream.mjs";
 
 dns.setDefaultResultOrder("ipv4first");
 
@@ -15,15 +23,14 @@ export default async function handler(req, res) {
     return;
   }
 
-  const key = (process.env.ANTHROPIC_API_KEY || "").trim();
-  if (!key) {
+  const creds = resolveClaudeCredentials(process.env);
+  if (!creds) {
     res.statusCode = 503;
     res.setHeader("Content-Type", "application/json");
     res.end(
       JSON.stringify({
         error: {
-          message:
-            "ANTHROPIC_API_KEY is not set on the server. Add it in Vercel → Settings → Environment Variables.",
+          message: `${claudeCredentialsMissingMessage()} Add them in Vercel → Settings → Environment Variables.`,
         },
       })
     );
@@ -35,19 +42,7 @@ export default async function handler(req, res) {
   const body = Buffer.concat(chunks).toString("utf8");
 
   try {
-    const r = await fetchAnthropicWithRetry(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": key,
-          "anthropic-version": "2023-06-01",
-        },
-        body,
-      },
-      3
-    );
+    const r = await proxyClaudeMessages(body, process.env, 3);
     const buf = Buffer.from(await r.arrayBuffer());
     res.statusCode = r.status;
     res.setHeader("Content-Type", r.headers.get("content-type") || "application/json");
@@ -56,6 +51,6 @@ export default async function handler(req, res) {
     console.error("[api/anthropic/messages] upstream fetch failed:", e);
     res.statusCode = 502;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ error: { message: anthropicProxyErrorMessage(e) } }));
+    res.end(JSON.stringify({ error: { message: claudeProxyErrorMessage(e, creds) } }));
   }
 }

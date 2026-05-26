@@ -1,7 +1,12 @@
 import dns from "node:dns";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
-import { anthropicProxyErrorMessage, fetchAnthropicWithRetry } from "./server/anthropic-upstream.mjs";
+import {
+  claudeCredentialsMissingMessage,
+  claudeProxyErrorMessage,
+  proxyClaudeMessages,
+  resolveClaudeCredentials,
+} from "./server/claude-upstream.mjs";
 import { fetchNdbcSpecUpstream } from "./server/ndbc-upstream.mjs";
 
 async function proxyNdbcSpec(req, res, stationId) {
@@ -53,15 +58,17 @@ export default defineConfig(({ mode }) => {
               return next();
             }
 
-            const key = (env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim();
-            if (!key) {
+            const creds = resolveClaudeCredentials({
+              ...process.env,
+              ...env,
+            });
+            if (!creds) {
               res.statusCode = 503;
               res.setHeader("Content-Type", "application/json");
               res.end(
                 JSON.stringify({
                   error: {
-                    message:
-                      "ANTHROPIC_API_KEY is not set. Add it to .env.local and restart npm run dev.",
+                    message: `${claudeCredentialsMissingMessage()} Restart npm run dev after updating .env.local.`,
                   },
                 })
               );
@@ -73,15 +80,7 @@ export default defineConfig(({ mode }) => {
             const body = Buffer.concat(chunks).toString("utf8");
 
             try {
-              const r = await fetchAnthropicWithRetry("https://api.anthropic.com/v1/messages", {
-                method: "POST",
-                headers: {
-                  "content-type": "application/json",
-                  "x-api-key": key,
-                  "anthropic-version": "2023-06-01",
-                },
-                body,
-              }, 3);
+              const r = await proxyClaudeMessages(body, { ...process.env, ...env }, 3);
               const buf = Buffer.from(await r.arrayBuffer());
               res.statusCode = r.status;
               const ct = r.headers.get("content-type") || "application/json";
@@ -93,7 +92,7 @@ export default defineConfig(({ mode }) => {
               res.setHeader("Content-Type", "application/json");
               res.end(
                 JSON.stringify({
-                  error: { message: anthropicProxyErrorMessage(e) },
+                  error: { message: claudeProxyErrorMessage(e, creds) },
                 })
               );
             }
