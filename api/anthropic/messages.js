@@ -1,8 +1,9 @@
 /**
  * Vercel Serverless Function: same path as Vite dev proxy (`POST /api/anthropic/messages`).
  * Credentials (server-side, no VITE_ prefix):
- *   - CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (preferred)
- *   - optional CLOUDFLARE_AI_GATEWAY_ID
+ *   - CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (routes via gateway.ai.cloudflare.com)
+ *   - CLOUDFLARE_AI_GATEWAY_ID (defaults to "default")
+ *   - CLOUDFLARE_MODEL=@cf/... for Workers AI (no Anthropic billing)
  *   - or ANTHROPIC_API_KEY (legacy direct Anthropic)
  */
 import dns from "node:dns";

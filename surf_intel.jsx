@@ -75,6 +75,15 @@ const fmtSurfFt = ft => {
 };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+const getAiModel = () =>
+  (import.meta.env.VITE_CLOUDFLARE_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "@cf/meta/llama-3.1-70b-instruct").trim();
+
+const getAiFallbackModel = () =>
+  (import.meta.env.VITE_CLOUDFLARE_FALLBACK_MODEL || import.meta.env.VITE_ANTHROPIC_FALLBACK_MODEL || getAiModel()).trim();
+
+const getAiSpotConfigModel = () =>
+  (import.meta.env.VITE_CLOUDFLARE_SPOT_CONFIG_MODEL || import.meta.env.VITE_ANTHROPIC_SPOT_CONFIG_MODEL || getAiModel()).trim();
+
 /** Vite dev: `/api/anthropic/messages`. Standalone proxy: `origin` + `/v1/messages`. */
 const getAnthropicMessagesUrl = () => {
   const raw = (import.meta.env.VITE_ANTHROPIC_PROXY_URL || "").trim();
@@ -578,7 +587,7 @@ const fetchTomTomLocationOptions = async (query, apiKey, opts = {}) => {
 
 const fetchSurfSpotConfigFromAnthropic = async (spotName, regionHint) => {
   const anthropicUrl = getAnthropicMessagesUrl();
-  const model = (import.meta.env.VITE_ANTHROPIC_SPOT_CONFIG_MODEL || import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
+  const model = getAiSpotConfigModel();
   const res = await fetch(anthropicUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1533,7 +1542,7 @@ function SetupScreen({
         }}>FETCH CONDITIONS →</button>
 
         <p style={{ textAlign: "center", fontSize: 9, color: THEME.textSoft, marginTop: 10, letterSpacing: 0.8 }}>
-          Open-Meteo Marine API · NOAA CO-OPS (nearest station per spot) · Claude AI
+          Open-Meteo Marine API · NOAA CO-OPS (nearest station per spot) · Cloudflare Llama 70B
         </p>
       </div>
     </div>
@@ -1943,7 +1952,7 @@ function Dashboard({
           ) : (
             <div>
               <div style={{ fontSize: 12, color: THEME.textSoft, marginBottom: 14, lineHeight: 1.55 }}>
-                Tap below to use Claude on the current conditions. You only get one AI call per session, so make it count.
+                Tap below to generate a recommendation from current conditions. You only get one call per session, so make it count.
               </div>
               <button
                 onClick={onGenerateAi}
@@ -1961,7 +1970,7 @@ function Dashboard({
                   fontFamily: "'Space Mono', monospace",
                 }}
               >
-                GENERATE AI RECOMMENDATION
+                GENERATE RECOMMENDATION
               </button>
             </div>
           )}
@@ -1991,7 +2000,7 @@ function Dashboard({
               "Open-Meteo Forecast API",
               "NOAA CO-OPS Tides",
               "TomTom Routing API",
-              "Anthropic Claude Sonnet",
+              "Cloudflare Llama 70B",
             ].map(s => (
               <div key={s} style={{ fontSize: 9, color: THEME.muted, marginBottom: 4 }}>· {s}</div>
             ))}
@@ -2105,8 +2114,8 @@ export default function App() {
     }).join("\n");
 
     const anthropicUrl = getAnthropicMessagesUrl();
-    const primaryModel = (import.meta.env.VITE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001").trim();
-    const fallbackModel = (import.meta.env.VITE_ANTHROPIC_FALLBACK_MODEL || "claude-sonnet-4-6").trim();
+    const primaryModel = getAiModel();
+    const fallbackModel = getAiFallbackModel();
     const modelChain = [...new Set([primaryModel, fallbackModel].filter(Boolean))];
     const maxAttempts = 3;
     setAiRec({ text: "", loading: true, retryAttempt: 1, maxAttempts });
@@ -2147,7 +2156,11 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
           });
           const json = await res.json().catch(() => ({}));
           if (!res.ok) {
-            lastErr = json.error?.message || json.message || `HTTP ${res.status}`;
+            lastErr =
+              json.error?.message
+              || json.errors?.[0]?.message
+              || json.message
+              || `HTTP ${res.status}`;
             continue;
           }
           const text = json.content?.find(b => b.type === "text")?.text || "No recommendation available.";

@@ -16,6 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   claudeCredentialsMissingMessage,
+  getClaudeProviderStatus,
   proxyClaudeMessages,
   resolveClaudeCredentials,
 } from "./claude-upstream.mjs";
@@ -110,7 +111,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  const status = getClaudeProviderStatus(env);
   console.log(
-    `Claude proxy (${creds.provider}) listening on http://127.0.0.1:${PORT} (POST /v1/messages)`
+    `Claude proxy (${status.provider}) → ${status.gatewayId || "n/a"} on http://127.0.0.1:${PORT}`
   );
 });
