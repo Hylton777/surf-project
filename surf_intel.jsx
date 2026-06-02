@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { DEFAULT_NDBC_STATION_ID, DEFAULT_WEIGHTS, SPOT_CONFIGS, getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "./surfSpotConfigs";
+import { buildAiRecommendationPrompt } from "./src/buildAiRecommendationPrompt.js";
+import { loadUserProfile, saveUserProfile } from "./src/userProfile.js";
 import { computeSurfScore } from "./src/surfScorer";
 import {
   computeHourlySurfForecast,
@@ -2357,7 +2359,7 @@ function Dashboard({
           ) : (
             <div>
               <div style={{ fontSize: 12, color: THEME.textSoft, marginBottom: 14, lineHeight: 1.55 }}>
-                Tap below to generate a recommendation from current conditions. You only get one call per session, so make it count.
+                Tap below for a coach write-up using your skill, quiver, drive times, app quality scores, and hourly forecasts. One call per session.
               </div>
               <button
                 onClick={onGenerateAi}
@@ -2453,6 +2455,22 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
 
   const toggleBoard = id => setQuiver(q => q.includes(id) ? q.filter(x => x !== id) : [...q, id]);
 
+  useEffect(() => {
+    if (!user?.id) return undefined;
+    let cancelled = false;
+    loadUserProfile(user.id).then(profile => {
+      if (cancelled || !profile) return;
+      setSkill(profile.skill);
+      if (profile.quiver?.length) setQuiver(profile.quiver);
+      setCustomBoard(profile.customBoard || "");
+      if (profile.driveOrigin) setDriveOrigin(profile.driveOrigin);
+      if (profile.driveOriginResolved) setDriveOriginResolved(profile.driveOriginResolved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
   const resolveAndAutofillDriveOrigin = async () => {
     const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
     const raw = driveOrigin.trim();
@@ -2505,19 +2523,23 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
       ...(customBoard.trim() ? [customBoard.trim()] : []),
     ].join(", ") || "unspecified";
 
-    const condLines = spotsForAi.map(s => {
-      const d = data[s.id];
-      if (!d) return `${s.name}: no data`;
-      return `${s.name} (${s.type}, ${s.difficulty}): ${fmtSurfFt(d.surfHeightFt)}ft, ${d.swellPeriod?.toFixed(0)}s swell from ${degToCompass(d.swellDir)}, wind ${d.windSpeed?.toFixed(0)}mph from ${degToCompass(d.windDir)}${d.forecastSource === "blend" ? ", NDBC blend" : ""}`;
-    }).join("\n");
-
-    const tideBlock = spotsForAi.map(s => {
-      const preds = tideData?.[s.tideStationId] || [];
-      const line = preds.slice(0, 8)
-        .map(t => `${t.t}: ${t.type === "H" ? "High" : "Low"} ${parseFloat(t.v).toFixed(1)}ft`)
-        .join(", ");
-      return `${s.name} — NOAA ${s.tideStationId} (${s.tideStationLabel}): ${line || "no predictions"}`;
-    }).join("\n");
+    const rankedSpots = sortSpotsByScore(spotsForAi, data, tideData, driveTimes);
+    const { system, userMessage } = buildAiRecommendationPrompt({
+      user,
+      preferences: {
+        skill,
+        quiverDesc,
+        customBoard,
+        driveOrigin: driveOrigin.trim() || "not set",
+      },
+      spots: spotsForAi,
+      spotData: data,
+      tidesByStation: tideData,
+      driveTimes,
+      activeSpot,
+      computeDisplayScore,
+      rankedSpots,
+    });
 
     const anthropicUrl = getAnthropicMessagesUrl();
     const primaryModel = getAiModel();
@@ -2536,28 +2558,9 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               model,
-              max_tokens: 1000,
-              messages: [{
-                role: "user",
-                content: `You are an expert Bay Area surf coach giving a concise, direct session recommendation. Use real surf lingo.
-
-CURRENT CONDITIONS:
-${condLines}
-
-TIDES (nearest NOAA station per spot, next events):
-${tideBlock}
-
-SURFER: ${skill} level. Quiver: ${quiverDesc}
-
-Provide a recommendation covering exactly these 5 points, each on its own paragraph:
-**Best Spot** — name the spot and give the specific reason based on today's numbers.
-**Best Window** — exact time range today, grounded in the tide schedule and swell trend.
-**Board Pick** — which board from their quiver to grab, and the technical reason why.
-**In the Water** — what to expect: crowds, hazards, vibe. 2–3 sentences.
-**Local Tip** — one insider tip that only a regular at that spot would know.
-
-Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
-              }],
+              max_tokens: 1200,
+              system,
+              messages: [{ role: "user", content: userMessage }],
             }),
           });
           const json = await res.json().catch(() => ({}));
@@ -2586,6 +2589,15 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
   };
 
   const loadData = async () => {
+    if (user?.id) {
+      await saveUserProfile(user.id, {
+        skill,
+        quiver,
+        customBoard,
+        driveOrigin,
+        driveOriginResolved,
+      });
+    }
     setScreen("loading");
     try {
       const marines = await Promise.all(spots.map(s => fetchMarine(s.lat, s.lon).catch(() => null)));
