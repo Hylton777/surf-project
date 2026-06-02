@@ -1898,6 +1898,10 @@ function LoadingScreen({ spotCount }) {
 }
 
 function Dashboard({
+  user,
+  onLogin,
+  onLogout,
+  onChangePreferences,
   spots,
   spotData,
   driveTimes,
@@ -1948,20 +1952,111 @@ function Dashboard({
     }}>
       <style>{FONTS}</style>
 
-      {/* ── Top bar ── */}
+      {/* ── Top bar: logo · date · preferences · auth ── */}
       <div style={{
-        padding: "0 24px", height: 52, display: "flex", alignItems: "center",
-        justifyContent: "space-between", borderBottom: `1px solid ${THEME.border}`, flexShrink: 0,
-        background: "rgba(255,255,255,0.72)", backdropFilter: "blur(4px)",
+        padding: "0 20px",
+        height: 52,
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        borderBottom: `1px solid ${THEME.border}`,
+        flexShrink: 0,
+        background: "rgba(255,255,255,0.72)",
+        backdropFilter: "blur(4px)",
       }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 14 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexShrink: 0 }}>
           <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 20, color: THEME.textStrong }}>SURF INTEL</span>
           <span style={{ fontSize: 9, letterSpacing: 3, color: THEME.textSoft }}>BAY AREA</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-          <span style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace" }}>{dateStr} · {timeStr}</span>
-          <span style={{ fontSize: 10, color: THEME.textSoft }}>{skill} · {quiver.length} boards</span>
+
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 2,
+            minWidth: 0,
+          }}
+        >
+          <span style={{ fontSize: 10, color: THEME.text, fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>
+            {dateStr} · {timeStr}
+          </span>
+          <span style={{ fontSize: 10, color: THEME.textSoft }}>
+            {skill} · {quiver.length} board{quiver.length === 1 ? "" : "s"}
+            {!user && (
+              <span style={{ color: THEME.muted }}> · not saved until you log in</span>
+            )}
+          </span>
         </div>
+
+        <button
+          type="button"
+          onClick={onChangePreferences}
+          title={user ? "Update skill, quiver, and start location" : "Update preferences for this session only"}
+          style={{
+            flexShrink: 0,
+            padding: "7px 12px",
+            fontSize: 9,
+            letterSpacing: 1,
+            fontFamily: "'Space Mono', monospace",
+            color: THEME.accent,
+            background: THEME.accentSoft,
+            border: `1px solid ${THEME.border}`,
+            borderRadius: 6,
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Change preferences
+        </button>
+
+        {user ? (
+          <button
+            type="button"
+            onClick={onLogout}
+            style={{
+              flexShrink: 0,
+              padding: "7px 14px",
+              fontSize: 9,
+              letterSpacing: 2,
+              fontFamily: "'Space Mono', monospace",
+              fontWeight: 700,
+              color: THEME.textSoft,
+              background: THEME.panel,
+              border: `1px solid ${THEME.border}`,
+              borderRadius: 6,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+            title={user.email || "Log out"}
+          >
+            LOG OUT
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onLogin}
+            title="Log in to save your preferences for personalized surf recommendations"
+            style={{
+              flexShrink: 0,
+              padding: "7px 14px",
+              fontSize: 9,
+              letterSpacing: 2,
+              fontFamily: "'Space Mono', monospace",
+              fontWeight: 700,
+              color: "#fff",
+              background: THEME.accent,
+              border: "none",
+              borderRadius: 6,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            LOG IN
+          </button>
+        )}
       </div>
 
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
@@ -2330,7 +2425,7 @@ function Dashboard({
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
-export default function App() {
+export function SurfDashboard({ user, onLogin, onLogout }) {
   const [screen, setScreen] = useState("setup");
   const [skill, setSkill] = useState("Intermediate");
   const [quiver, setQuiver] = useState(["longboard", "shortboard"]);
@@ -2714,7 +2809,7 @@ Max 230 words. No preamble or sign-off. Start directly with **Best Spot**.`,
   if (screen === "loading") return <LoadingScreen spotCount={spots.length} />;
 
   return (
-    <Dashboard spots={spots} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
+    <Dashboard user={user} onLogin={onLogin} onLogout={onLogout} onChangePreferences={() => setScreen("setup")} spots={spots} spotData={spotData} driveTimes={driveTimes} activeSpot={activeSpot}
       setActiveSpot={setActiveSpot} tidesByStation={tidesByStation} aiRec={aiRec}
       aiCalled={aiCalled}
       skill={skill} quiver={quiver}

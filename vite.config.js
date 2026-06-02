@@ -54,6 +54,7 @@ export default defineConfig(({ mode }) => {
   );
 
   return {
+    envPrefix: ["VITE_", "REACT_APP_"],
     define: {
       "import.meta.env.VITE_CLOUDFLARE_MODEL": JSON.stringify(cloudflareModel),
       "import.meta.env.VITE_CLOUDFLARE_SPOT_CONFIG_MODEL": JSON.stringify(cloudflareSpotModel),
