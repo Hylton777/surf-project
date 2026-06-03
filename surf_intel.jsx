@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { DEFAULT_NDBC_STATION_ID, DEFAULT_WEIGHTS, SPOT_CONFIGS, getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "./surfSpotConfigs";
 import { buildAiRecommendationPrompt } from "./src/buildAiRecommendationPrompt.js";
-import { loadUserProfile, saveUserProfile } from "./src/userProfile.js";
+import { loadUserProfile, loadUserProfileLocal, saveUserProfile } from "./src/userProfile.js";
+import { loadSurfSessions, saveSurfSession, deleteSurfSession } from "./src/surfSessions.js";
+import { resolveSessionForecastSnapshot, todayInTimeZone } from "./src/sessionForecast.js";
+import { sortSpotsWithPreferences } from "./src/sessionSimilarity.js";
 import { computeSurfScore } from "./src/surfScorer";
 import {
   computeHourlySurfForecast,
@@ -486,15 +489,41 @@ const computeDisplayScore = (spot, d, tidesByStation) => {
   const spotConfig = getSpotScoringConfig(spot);
   if (!spotConfig) return null;
 
+  const tidePredictions = tidesByStation?.[spot.tideStationId];
+  let tide = getNearestTideValue(tidePredictions);
+  if (d.isForecastToday === false && d.forecastDate) {
+    const refMs = parseHourTimeMs(`${d.forecastDate}T12:00`);
+    const tideAtDay = getTideAtTime(tidePredictions, refMs);
+    if (Number.isFinite(tideAtDay)) tide = tideAtDay;
+  }
+
   const conditions = {
     swellHeight: Number.isFinite(d.surfHeightFt) ? d.surfHeightFt : 0,
     swellPeriod: Number.isFinite(d.swellPeriod) && d.swellPeriod > 0 ? d.swellPeriod : d.wavePeriod,
     swellDirection: Number.isFinite(d.swellDir) ? d.swellDir : d.waveDir,
     windSpeed: (Number(d.windSpeed) || 0) * MPH_TO_KNOTS,
     windDirection: Number(d.windDir) || 0,
-    tide: getNearestTideValue(tidesByStation?.[spot.tideStationId]),
+    tide,
   };
   return computeSurfScore(conditions, spotConfig);
+};
+
+const buildSpotDataMapForDate = (spotsList, rawBySpot, buoyState, tidesState, dateStr) => {
+  const out = {};
+  for (const spot of spotsList) {
+    const raw = rawBySpot[spot.id];
+    if (!raw?.marine?.hourly) continue;
+    const built = buildSpotCondition(
+      spot,
+      raw.marine,
+      raw.wind,
+      buoyState,
+      tidesState[spot.tideStationId] || [],
+      dateStr
+    );
+    if (built) out[spot.id] = built;
+  }
+  return out;
 };
 
 const sortSpotsByScore = (spots, spotData, tidesByStation, driveTimes) =>
@@ -507,6 +536,21 @@ const sortSpotsByScore = (spots, spotData, tidesByStation, driveTimes) =>
     if (aDrive !== bDrive) return aDrive - bDrive;
     return a.shortName.localeCompare(b.shortName);
   });
+
+const rankSpots = (spots, spotData, tidesByStation, driveTimes, surfSessions = []) => {
+  if (surfSessions?.length) {
+    return sortSpotsWithPreferences({
+      spots,
+      spotData,
+      tidesByStation,
+      driveTimes,
+      sessions: surfSessions,
+      computeDisplayScore,
+      parseDriveTimeMinutes,
+    });
+  }
+  return sortSpotsByScore(spots, spotData, tidesByStation, driveTimes);
+};
 
 const getNearestTideStationMeta = (lat, lon) => {
   const nearest = SPOTS.reduce((best, s) => {
@@ -690,12 +734,46 @@ const fetchWind = (lat, lon) =>
   fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&past_days=1&forecast_days=2&timezone=America%2FLos_Angeles&wind_speed_unit=mph`)
     .then(r => r.json());
 
+const LA_FORECAST_TZ = "America/Los_Angeles";
+
+const todayForecastDate = () =>
+  new Date().toLocaleDateString("en-CA", { timeZone: LA_FORECAST_TZ });
+
+const shiftForecastDate = (dateStr, deltaDays) => {
+  const d = new Date(`${dateStr}T12:00:00`);
+  d.setDate(d.getDate() + deltaDays);
+  return d.toLocaleDateString("en-CA", { timeZone: LA_FORECAST_TZ });
+};
+
+const getForecastDateBounds = () => {
+  const today = todayForecastDate();
+  return { today, min: shiftForecastDate(today, -1), max: shiftForecastDate(today, 1) };
+};
+
+const formatForecastNavDate = dateStr =>
+  new Date(`${dateStr}T12:00:00`).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: LA_FORECAST_TZ,
+  });
+
+const formatForecastCenterLabel = dateStr => {
+  const { today, min, max } = getForecastDateBounds();
+  if (dateStr === today) return "Today";
+  if (dateStr === min) return "Yesterday";
+  if (dateStr === max) return "Tomorrow";
+  return formatForecastNavDate(dateStr);
+};
+
+const filterTidesForDate = (predictions, dateStr) =>
+  (predictions || []).filter(p => String(p?.t || "").startsWith(dateStr));
+
 const fetchTides = stationId => {
   const pad = n => String(n).padStart(2, "0");
-  const d = new Date();
-  const t = new Date(d); t.setDate(t.getDate() + 1);
-  const fmt = x => `${x.getFullYear()}${pad(x.getMonth()+1)}${pad(x.getDate())}`;
-  return fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(d)}&end_date=${fmt(t)}&station=${stationId}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=hilo&units=english&application=cs153&format=json`)
+  const { min, max } = getForecastDateBounds();
+  const endExclusive = shiftForecastDate(max, 1);
+  const fmt = dateStr => dateStr.replace(/-/g, "");
+  return fetch(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${fmt(min)}&end_date=${fmt(endExclusive)}&station=${stationId}&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=hilo&units=english&application=cs153&format=json`)
     .then(r => r.json());
 };
 
@@ -895,27 +973,36 @@ const fetchMissingDriveTimes = async (spots, existingDriveTimes = {}, originInpu
   return fetchDriveTimes(missing, originInput);
 };
 
-const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}, tidePredictions = []) => {
+const buildSpotCondition = (
+  spot,
+  marineJson,
+  windJson,
+  buoyByStation = {},
+  tidePredictions = [],
+  forecastDate = null
+) => {
   if (!marineJson?.hourly) return null;
   const spotConfig = getSpotScoringConfig(spot);
   if (!spotConfig) return null;
 
-  const ndbcId = getNdbcStationIdForSpot(spot);
-  const buoyObservation = buoyObservationForBlend(buoyByStation[ndbcId]);
+  const today = todayForecastDate();
+  const targetDate = forecastDate || today;
+  const isToday = targetDate === today;
 
-  const hi = getCurrentHourIdx(marineJson.hourly.time);
-  const wi = alignHourIdx(marineJson.hourly.time, windJson?.hourly?.time, hi);
-  const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
+  const ndbcId = getNdbcStationIdForSpot(spot);
+  const buoyObservation = isToday ? buoyObservationForBlend(buoyByStation[ndbcId]) : null;
 
   const hourlyTimes = marineJson.hourly.time || [];
-  // Calendar-day window matching Open-Meteo timezone=America/Los_Angeles
-  const todayPrefix = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
-  let dayStartIdx = hourlyTimes.findIndex(t => typeof t === "string" && t.startsWith(todayPrefix));
-  if (dayStartIdx < 0) {
-    // Fallback: roll forward/backward from current index to get a continuous 24h window
-    dayStartIdx = Math.max(0, Math.min(hi, Math.max(0, hourlyTimes.length - 24)));
-  }
+  let dayStartIdx = hourlyTimes.findIndex(t => typeof t === "string" && t.startsWith(targetDate));
+  if (dayStartIdx < 0) return null;
+
   const dayTimes = hourlyTimes.slice(dayStartIdx, dayStartIdx + 24);
+  if (!dayTimes.length) return null;
+
+  const nowHi = getCurrentHourIdx(hourlyTimes);
+  const anchorHi = isToday ? nowHi : Math.min(dayStartIdx + 12, hourlyTimes.length - 1);
+  const wi = alignHourIdx(hourlyTimes, windJson?.hourly?.time, anchorHi);
+  const sl = (arr, start, n = 12) => (arr || []).slice(start, start + n);
 
   const { points: dayForecastPoints, anchor, anchorBuoy } = buildDayForecastPoints(
     marineJson,
@@ -925,71 +1012,178 @@ const buildSpotCondition = (spot, marineJson, windJson, buoyByStation = {}, tide
     tidePredictions,
     dayStartIdx,
     dayTimes,
-    hi
+    anchorHi
   );
   const daySurfHeights = dayForecastPoints.map(p => p.surfHeightFt);
   const currentForecast = anchorBuoy;
+  const forecastStartIdx = isToday ? nowHi : dayStartIdx;
   const forecastSurf = buildForecastHeightSeries(
     marineJson,
     spotConfig,
     buoyObservation,
     windJson,
     tidePredictions,
-    hi,
+    forecastStartIdx,
     12,
     anchor
   );
 
   return {
-    waveHeight: marineJson.hourly.wave_height?.[hi] ?? 0,
-    wavePeriod: marineJson.hourly.wave_period?.[hi] ?? 0,
-    waveDir: marineJson.hourly.wave_direction?.[hi] ?? 0,
-    swellHeight: marineJson.hourly.swell_wave_height?.[hi] ?? 0,
+    waveHeight: marineJson.hourly.wave_height?.[anchorHi] ?? 0,
+    wavePeriod: marineJson.hourly.wave_period?.[anchorHi] ?? 0,
+    waveDir: marineJson.hourly.wave_direction?.[anchorHi] ?? 0,
+    swellHeight: marineJson.hourly.swell_wave_height?.[anchorHi] ?? 0,
     swellPeriod: currentForecast.swellPeriod,
-    swellDir: currentForecast.swellDir ?? marineJson.hourly.swell_wave_direction?.[hi] ?? 0,
-    windWaveHeight: marineJson.hourly.wind_wave_height?.[hi] ?? 0,
+    swellDir: currentForecast.swellDir ?? marineJson.hourly.swell_wave_direction?.[anchorHi] ?? 0,
+    windWaveHeight: marineJson.hourly.wind_wave_height?.[anchorHi] ?? 0,
     windSpeed: windJson?.hourly?.wind_speed_10m?.[wi] ?? 0,
     windDir: windJson?.hourly?.wind_direction_10m?.[wi] ?? 0,
     surfHeightFt: currentForecast.surfHeightFt,
     surfHeightDescriptor: currentForecast.descriptor,
     swellHsFt: currentForecast.swellHsFt,
-    forecastSource: currentForecast.source,
-    buoyHsFt: currentForecast.buoyHsFt,
-    buoyAgeMinutes: currentForecast.buoyAgeMinutes,
+    forecastSource: isToday ? (currentForecast.source || "model") : "model",
+    buoyHsFt: isToday ? currentForecast.buoyHsFt : null,
+    buoyAgeMinutes: isToday ? currentForecast.buoyAgeMinutes : null,
     ndbcStationId: ndbcId,
-    times: sl(marineJson.hourly.time, hi),
+    times: sl(marineJson.hourly.time, forecastStartIdx),
     forecastWave: forecastSurf,
     forecastWind: sl(windJson?.hourly?.wind_speed_10m, wi),
     dayTimes,
     dayWaveHeights: daySurfHeights,
     daySurfHeights,
     dayForecastPoints,
+    forecastDate: targetDate,
+    isForecastToday: isToday,
   };
 };
 
-const fetchSpotCondition = async (spot, buoyByStation = {}) => {
+const fetchSpotCondition = async (spot, buoyByStation = {}, tidePredictions = [], forecastDate = null) => {
   try {
     const marine = await fetchMarine(spot.lat, spot.lon).catch(() => null);
     if (!marine?.hourly) return null;
     const lat = marine?.latitude ?? spot.lat;
     const lon = marine?.longitude ?? spot.lon;
     const wind = await fetchWind(lat, lon).catch(() => null);
-    return buildSpotCondition(spot, marine, wind, buoyByStation);
+    return buildSpotCondition(spot, marine, wind, buoyByStation, tidePredictions, forecastDate);
   } catch {
     return null;
   }
 };
 
-const fetchMissingSpotData = async (spots, existingSpotData = {}, buoyByStation = {}) => {
-  const missing = spots.filter(s => !existingSpotData[s.id]);
-  if (!missing.length) return {};
+const fetchSpotForecastBundle = async (spot, buoyByStation = {}, tidePredictions = [], forecastDate = null) => {
+  try {
+    const marine = await fetchMarine(spot.lat, spot.lon).catch(() => null);
+    if (!marine?.hourly) return null;
+    const lat = marine?.latitude ?? spot.lat;
+    const lon = marine?.longitude ?? spot.lon;
+    const wind = await fetchWind(lat, lon).catch(() => null);
+    const condition = buildSpotCondition(spot, marine, wind, buoyByStation, tidePredictions, forecastDate);
+    if (!condition) return null;
+    return { marine, wind, condition };
+  } catch {
+    return null;
+  }
+};
+
+const fetchMissingSpotData = async (
+  spotsList,
+  existingSpotData = {},
+  buoyState = {},
+  tidesState = {},
+  dateStr = null
+) => {
+  const missing = spotsList.filter(s => !existingSpotData[s.id]);
+  if (!missing.length) return { spotData: {}, rawBySpot: {} };
+  const targetDate = dateStr || todayForecastDate();
   const pairs = await Promise.all(
-    missing.map(async spot => [spot.id, await fetchSpotCondition(spot, buoyByStation)])
+    missing.map(async spot => {
+      const bundle = await fetchSpotForecastBundle(
+        spot,
+        buoyState,
+        tidesState[spot.tideStationId] || [],
+        targetDate
+      );
+      return [spot.id, bundle];
+    })
   );
-  return Object.fromEntries(pairs.filter(([, v]) => !!v));
+  const spotData = {};
+  const rawBySpot = {};
+  for (const [id, bundle] of pairs) {
+    if (!bundle) continue;
+    spotData[id] = bundle.condition;
+    rawBySpot[id] = { marine: bundle.marine, wind: bundle.wind };
+  }
+  return { spotData, rawBySpot };
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
+
+function ForecastDateNav({ date, onChange, compact = false }) {
+  const { min, max } = getForecastDateBounds();
+  const prevDate = shiftForecastDate(date, -1);
+  const nextDate = shiftForecastDate(date, 1);
+  const canPrev = date > min;
+  const canNext = date < max;
+
+  const btnStyle = disabled => ({
+    border: `1px solid ${THEME.border}`,
+    background: disabled ? THEME.bgSoft : THEME.panel,
+    color: disabled ? THEME.muted : THEME.accent,
+    borderRadius: 5,
+    padding: compact ? "2px 5px" : "4px 8px",
+    fontSize: compact ? 8 : 9,
+    letterSpacing: 0.5,
+    cursor: disabled ? "default" : "pointer",
+    fontFamily: "'Space Mono', monospace",
+    lineHeight: 1.2,
+    whiteSpace: "nowrap",
+  });
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 4,
+        marginTop: compact ? 6 : 0,
+      }}
+      onClick={e => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        disabled={!canPrev}
+        onClick={() => canPrev && onChange(prevDate)}
+        title={canPrev ? formatForecastCenterLabel(prevDate) : "Earliest available day"}
+        style={btnStyle(!canPrev)}
+      >
+        ← {formatForecastNavDate(prevDate)}
+      </button>
+      <span
+        style={{
+          fontSize: compact ? 8 : 9,
+          color: THEME.textStrong,
+          fontFamily: "'Space Mono', monospace",
+          fontWeight: 700,
+          textAlign: "center",
+          flex: 1,
+          minWidth: 0,
+        }}
+      >
+        {formatForecastCenterLabel(date)}
+      </span>
+      <button
+        type="button"
+        disabled={!canNext}
+        onClick={() => canNext && onChange(nextDate)}
+        title={canNext ? formatForecastCenterLabel(nextDate) : "Latest available day"}
+        style={btnStyle(!canNext)}
+      >
+        {formatForecastNavDate(nextDate)} →
+      </button>
+    </div>
+  );
+}
 
 function Sparkline({ data, color = THEME.accent, height = 48 }) {
   if (!data?.length) return <svg width="100%" height={height} />;
@@ -1855,7 +2049,7 @@ function SetupScreen({
   );
 }
 
-function LoadingScreen({ spotCount }) {
+function LoadingScreen({ spotCount, subtitle }) {
   const [dots, setDots] = useState(".");
   useEffect(() => {
     const id = setInterval(() => setDots(d => d.length >= 3 ? "." : d + "."), 380);
@@ -1893,7 +2087,392 @@ function LoadingScreen({ spotCount }) {
         READING THE OCEAN{dots}
       </div>
       <div style={{ fontSize: 11, color: THEME.textSoft, marginTop: 10, fontFamily: "'Inter', sans-serif" }}>
-        Fetching swell, tides & wind data for {spotCount} spots
+        {subtitle || `Fetching swell, tides & wind data for ${spotCount} spots`}
+      </div>
+    </div>
+  );
+}
+
+function StarRatingInput({ value, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      {[1, 2, 3, 4, 5].map(n => (
+        <button
+          key={n}
+          type="button"
+          onClick={() => onChange(n)}
+          aria-label={`${n} star${n === 1 ? "" : "s"}`}
+          style={{
+            border: "none",
+            background: "transparent",
+            cursor: "pointer",
+            fontSize: 26,
+            lineHeight: 1,
+            padding: 0,
+            color: n <= value ? "#eab308" : "#cbd5e1",
+          }}
+        >
+          ★
+        </button>
+      ))}
+      <span style={{ fontSize: 11, color: THEME.textSoft, marginLeft: 4 }}>
+        {value ? `${value}/5 surf quality` : "Rate the surf (not crowds)"}
+      </span>
+    </div>
+  );
+}
+
+function LogSessionModal({
+  spot,
+  quiver,
+  spotData,
+  getSpotScoringConfig,
+  onClose,
+  onSave,
+}) {
+  const [sessionDate, setSessionDate] = useState(todayInTimeZone());
+  const [startTime, setStartTime] = useState("07:00");
+  const [endTime, setEndTime] = useState("09:00");
+  const [boardId, setBoardId] = useState(quiver[0] || "");
+  const [stars, setStars] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const quiverBoards = BOARDS.filter(b => quiver.includes(b.id));
+
+  useEffect(() => {
+    if (boardId && quiver.includes(boardId)) return;
+    setBoardId(quiver[0] || "");
+  }, [quiver, boardId]);
+
+  const handleSubmit = async () => {
+    setError("");
+    if (!stars) {
+      setError("Tap a star rating (1–5).");
+      return;
+    }
+    if (!boardId) {
+      setError("Select a board from your quiver.");
+      return;
+    }
+    const startMin = parseInt(startTime.split(":")[0], 10) * 60 + parseInt(startTime.split(":")[1], 10);
+    const endMin = parseInt(endTime.split(":")[0], 10) * 60 + parseInt(endTime.split(":")[1], 10);
+    if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || endMin < startMin) {
+      setError("End time must be after start time.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const spotConfig = getSpotScoringConfig(spot);
+      const forecastSnapshot = await resolveSessionForecastSnapshot({
+        spot,
+        spotConfig,
+        spotData,
+        sessionDate,
+        startTime,
+        endTime,
+      });
+      if (!forecastSnapshot) {
+        setError("Could not load forecast for that date and time. Try a different window.");
+        return;
+      }
+      await onSave({
+        id: crypto.randomUUID?.() || `session_${Date.now()}`,
+        spotId: spot.id,
+        spotName: spot.name,
+        sessionDate,
+        startTime,
+        endTime,
+        boardId,
+        stars,
+        forecastSnapshot,
+        createdAt: new Date().toISOString(),
+      });
+      onClose();
+    } catch (e) {
+      setError(e?.message || "Failed to save session.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(10, 63, 82, 0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1000,
+        padding: 16,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: THEME.panel,
+          borderRadius: 10,
+          border: `1px solid ${THEME.border}`,
+          padding: "22px 24px",
+          width: "100%",
+          maxWidth: 420,
+          boxShadow: "0 12px 40px rgba(15,79,102,0.18)",
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 9, letterSpacing: 3, color: THEME.muted, marginBottom: 6 }}>LOG SESSION</div>
+        <h3 style={{ margin: "0 0 16px", fontFamily: "'Playfair Display', serif", color: THEME.textStrong, fontSize: 22 }}>
+          {spot.name}
+        </h3>
+
+        <label style={{ display: "block", fontSize: 9, letterSpacing: 2, color: THEME.textSoft, marginBottom: 6 }}>DATE</label>
+        <input
+          type="date"
+          value={sessionDate}
+          max={todayInTimeZone()}
+          onChange={e => setSessionDate(e.target.value)}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            marginBottom: 14,
+            padding: "8px 10px",
+            borderRadius: 6,
+            border: `1px solid ${THEME.border}`,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 12,
+          }}
+        />
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div>
+            <label style={{ display: "block", fontSize: 9, letterSpacing: 2, color: THEME.textSoft, marginBottom: 6 }}>START</label>
+            <input
+              type="time"
+              value={startTime}
+              onChange={e => setStartTime(e.target.value)}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "8px 10px",
+                borderRadius: 6,
+                border: `1px solid ${THEME.border}`,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 12,
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: "block", fontSize: 9, letterSpacing: 2, color: THEME.textSoft, marginBottom: 6 }}>END</label>
+            <input
+              type="time"
+              value={endTime}
+              onChange={e => setEndTime(e.target.value)}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "8px 10px",
+                borderRadius: 6,
+                border: `1px solid ${THEME.border}`,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 12,
+              }}
+            />
+          </div>
+        </div>
+
+        <label style={{ display: "block", fontSize: 9, letterSpacing: 2, color: THEME.textSoft, marginBottom: 8 }}>BOARD</label>
+        {quiverBoards.length ? (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+            {quiverBoards.map(b => (
+              <button
+                key={b.id}
+                type="button"
+                onClick={() => setBoardId(b.id)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: `1px solid ${boardId === b.id ? THEME.accent : THEME.border}`,
+                  background: boardId === b.id ? THEME.accentSoft : THEME.panel,
+                  color: boardId === b.id ? THEME.accent : THEME.textSoft,
+                  fontSize: 10,
+                  cursor: "pointer",
+                  fontFamily: "'Space Mono', monospace",
+                }}
+              >
+                {b.name}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 11, color: THEME.textSoft, marginBottom: 8 }}>No boards in your quiver.</div>
+        )}
+        <div style={{ fontSize: 10, color: THEME.muted, marginBottom: 14, lineHeight: 1.4 }}>
+          Don&apos;t see your board? Update your quiver in Change preferences.
+        </div>
+
+        <label style={{ display: "block", fontSize: 9, letterSpacing: 2, color: THEME.textSoft, marginBottom: 8 }}>
+          SURF QUALITY
+        </label>
+        <StarRatingInput value={stars} onChange={setStars} />
+
+        {sessionDate !== todayInTimeZone() && (
+          <div style={{ fontSize: 10, color: THEME.textSoft, marginTop: 12, lineHeight: 1.4 }}>
+            Loading archived forecast for {sessionDate} to match your rating to conditions you surfed.
+          </div>
+        )}
+
+        {error && (
+          <div style={{ fontSize: 11, color: "#dc2626", marginTop: 12 }}>{error}</div>
+        )}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={saving}
+            style={{
+              flex: 1,
+              padding: "10px 0",
+              borderRadius: 6,
+              border: "none",
+              background: THEME.accent,
+              color: "#fff",
+              fontSize: 10,
+              letterSpacing: 1.5,
+              cursor: saving ? "default" : "pointer",
+              fontFamily: "'Space Mono', monospace",
+              opacity: saving ? 0.7 : 1,
+            }}
+          >
+            {saving ? "SAVING…" : "SAVE SESSION"}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saving}
+            style={{
+              flex: 1,
+              padding: "10px 0",
+              borderRadius: 6,
+              border: `1px solid ${THEME.border}`,
+              background: THEME.panel,
+              color: THEME.textSoft,
+              fontSize: 10,
+              letterSpacing: 1.5,
+              cursor: "pointer",
+              fontFamily: "'Space Mono', monospace",
+            }}
+          >
+            CANCEL
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MySessionsPanel({ sessions, onClose, onDelete, boardNameForId }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(10, 63, 82, 0.45)",
+        display: "flex",
+        alignItems: "stretch",
+        justifyContent: "flex-end",
+        zIndex: 1000,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 420,
+          background: THEME.panel,
+          borderLeft: `1px solid ${THEME.border}`,
+          overflowY: "auto",
+          padding: "20px 18px",
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 9, letterSpacing: 3, color: THEME.muted }}>HISTORY</div>
+            <h3 style={{ margin: "4px 0 0", fontFamily: "'Playfair Display', serif", color: THEME.textStrong }}>My Sessions</h3>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              border: `1px solid ${THEME.border}`,
+              background: THEME.panel,
+              borderRadius: 6,
+              padding: "6px 10px",
+              fontSize: 10,
+              cursor: "pointer",
+              color: THEME.textSoft,
+              fontFamily: "'Space Mono', monospace",
+            }}
+          >
+            CLOSE
+          </button>
+        </div>
+
+        {!sessions.length ? (
+          <div style={{ fontSize: 12, color: THEME.textSoft, lineHeight: 1.5 }}>
+            No sessions logged yet. Use &quot;I surfed here today&quot; below any spot forecast.
+          </div>
+        ) : (
+          sessions.map(session => {
+            const snap = session.forecastSnapshot?.avg;
+            return (
+              <div
+                key={session.id}
+                style={{
+                  border: `1px solid ${THEME.border}`,
+                  borderRadius: 8,
+                  padding: "12px 14px",
+                  marginBottom: 10,
+                  background: THEME.bgSoft,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: THEME.textStrong }}>{session.spotName}</div>
+                  <div style={{ fontSize: 14, color: "#eab308", letterSpacing: 1 }}>
+                    {"★".repeat(session.stars)}{"☆".repeat(5 - session.stars)}
+                  </div>
+                </div>
+                <div style={{ fontSize: 10, color: THEME.textSoft, fontFamily: "'Space Mono', monospace", marginBottom: 4 }}>
+                  {session.sessionDate} · {session.startTime}–{session.endTime}
+                </div>
+                <div style={{ fontSize: 10, color: THEME.textSoft, marginBottom: 6 }}>
+                  {boardNameForId(session.boardId)}
+                  {snap ? ` · ${fmtSurfFt(snap.surfHeightFt)}ft @ ${snap.swellPeriod?.toFixed?.(0) || snap.swellPeriod}s · score ${snap.score ?? "—"}` : ""}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onDelete(session.id)}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    color: "#dc2626",
+                    fontSize: 9,
+                    letterSpacing: 1,
+                    cursor: "pointer",
+                    fontFamily: "'Space Mono', monospace",
+                    padding: 0,
+                  }}
+                >
+                  DELETE
+                </button>
+              </div>
+            );
+          })
+        )}
       </div>
     </div>
   );
@@ -1922,12 +2501,24 @@ function Dashboard({
   addSpotStatus,
   addSpotLoading,
   onAddSpot,
+  surfSessions,
+  logSessionOpen,
+  setLogSessionOpen,
+  mySessionsOpen,
+  setMySessionsOpen,
+  onSaveSession,
+  onDeleteSession,
+  getSpotScoringConfig,
+  forecastDate,
+  onForecastDateChange,
 }) {
   const [syncMs, setSyncMs] = useState(null);
   const data = spotData[activeSpot.id];
-  const spotTides = tidesByStation[activeSpot.tideStationId] || [];
+  const spotTides = filterTidesForDate(tidesByStation[activeSpot.tideStationId] || [], forecastDate);
   const activeSpotScore = computeDisplayScore(activeSpot, data, tidesByStation);
-  const sortedSpots = sortSpotsByScore(spots, spotData, tidesByStation, driveTimes);
+  const sortedSpots = rankSpots(spots, spotData, tidesByStation, driveTimes, surfSessions);
+
+  const boardNameForId = id => BOARDS.find(b => b.id === id)?.name || id;
 
   const formatAI = text =>
     text.replace(/\*\*(.*?)\*\*/g, `<strong style="color:${THEME.accent}">$1</strong>`)
@@ -2013,6 +2604,28 @@ function Dashboard({
         >
           Change preferences
         </button>
+
+        {user && (
+          <button
+            type="button"
+            onClick={() => setMySessionsOpen(true)}
+            style={{
+              flexShrink: 0,
+              padding: "7px 12px",
+              fontSize: 9,
+              letterSpacing: 1,
+              fontFamily: "'Space Mono', monospace",
+              color: THEME.textSoft,
+              background: THEME.panel,
+              border: `1px solid ${THEME.border}`,
+              borderRadius: 6,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            My sessions{surfSessions?.length ? ` (${surfSessions.length})` : ""}
+          </button>
+        )}
 
         {user ? (
           <button
@@ -2243,6 +2856,10 @@ function Dashboard({
                     {driveTimes[activeSpot.id] ? `${driveTimes[activeSpot.id]} DRIVE` : "DRIVE TIME —"}
                   </div>
                 </div>
+                <ForecastDateNav
+                  date={forecastDate}
+                  onChange={onForecastDateChange}
+                />
               </div>
 
               {/* Stat cards */}
@@ -2253,9 +2870,11 @@ function Dashboard({
                     value: `${fmtSurfFt(data.surfHeightFt)}ft`,
                     sub: [
                       data.swellPeriod ? `${data.swellPeriod.toFixed(0)}s period` : "",
-                      data.forecastSource === "blend" || data.forecastSource === "buoy"
+                      data.isForecastToday !== false && (data.forecastSource === "blend" || data.forecastSource === "buoy")
                         ? `NDBC blend (now) · ${data.ndbcStationId}`
-                        : "",
+                        : data.isForecastToday === false
+                          ? `${formatForecastCenterLabel(forecastDate)} · midday estimate`
+                          : "",
                     ].filter(Boolean).join(" · "),
                   },
                   { label: "SWELL DIR", value: degToCompass(data.swellDir), sub: `${Math.round(data.swellDir || 0)}° bearing` },
@@ -2294,9 +2913,13 @@ function Dashboard({
 
               {/* 24-hr wave forecast (full width) */}
               <div style={{ background: THEME.panel, borderRadius: 8, padding: "13px 16px", border: `1px solid ${THEME.border}`, marginBottom: 16 }}>
-                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 6 }}>24-HR SURF FORECAST (FACE HEIGHT)</div>
+                <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 6 }}>
+                  24-HR SURF FORECAST — {formatForecastCenterLabel(forecastDate).toUpperCase()}
+                </div>
                 <div style={{ fontSize: 10, color: THEME.textSoft, marginBottom: 12 }}>
-                  Hourly model + wind; now uses NDBC when available
+                  {data.isForecastToday !== false
+                    ? "Hourly model + wind; now uses NDBC when available"
+                    : "Hourly model forecast for selected day"}
                 </div>
                 <WaveForecastChart
                   points={data.dayForecastPoints}
@@ -2308,12 +2931,35 @@ function Dashboard({
               </div>
 
               {/* Tides */}
-              <div style={{ background: THEME.panel, borderRadius: 8, padding: "13px 16px", border: `1px solid ${THEME.border}` }}>
+              <div style={{ background: THEME.panel, borderRadius: 8, padding: "13px 16px", border: `1px solid ${THEME.border}`, marginBottom: user ? 12 : 0 }}>
                 <div style={{ fontSize: 8, letterSpacing: 3, color: THEME.muted, marginBottom: 14 }}>
                   TIDES — NOAA {activeSpot.tideStationId} · {activeSpot.tideStationLabel}
                 </div>
                 <TideChart tides={spotTides} syncMs={syncMs} onSyncHover={setSyncMs} />
               </div>
+
+              {user && (
+                <button
+                  type="button"
+                  onClick={() => setLogSessionOpen(true)}
+                  style={{
+                    width: "100%",
+                    marginTop: 4,
+                    padding: "11px 0",
+                    borderRadius: 8,
+                    border: `1px dashed ${THEME.accent}`,
+                    background: THEME.accentSoft,
+                    color: THEME.accent,
+                    fontSize: 10,
+                    letterSpacing: 1.5,
+                    cursor: "pointer",
+                    fontFamily: "'Space Mono', monospace",
+                    fontWeight: 700,
+                  }}
+                >
+                  I SURFED HERE TODAY
+                </button>
+              )}
             </>
           ) : (
             <div style={{ padding: 40, textAlign: "center", color: THEME.textSoft, fontSize: 13 }}>
@@ -2359,7 +3005,7 @@ function Dashboard({
           ) : (
             <div>
               <div style={{ fontSize: 12, color: THEME.textSoft, marginBottom: 14, lineHeight: 1.55 }}>
-                Tap below for a coach write-up using your skill, quiver, drive times, app quality scores, and hourly forecasts. One call per session.
+                Coach write-up for {formatForecastCenterLabel(forecastDate).toLowerCase()} using scores and hourly forecasts for all spots. One call per day selection.
               </div>
               <button
                 onClick={onGenerateAi}
@@ -2421,6 +3067,26 @@ function Dashboard({
           </div>
         </div>
       </div>
+
+      {logSessionOpen && user && (
+        <LogSessionModal
+          spot={activeSpot}
+          quiver={quiver}
+          spotData={spotData}
+          getSpotScoringConfig={getSpotScoringConfig}
+          onClose={() => setLogSessionOpen(false)}
+          onSave={onSaveSession}
+        />
+      )}
+
+      {mySessionsOpen && user && (
+        <MySessionsPanel
+          sessions={surfSessions}
+          onClose={() => setMySessionsOpen(false)}
+          onDelete={onDeleteSession}
+          boardNameForId={boardNameForId}
+        />
+      )}
     </div>
   );
 }
@@ -2428,16 +3094,18 @@ function Dashboard({
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export function SurfDashboard({ user, onLogin, onLogout }) {
+  const defaultDriveOrigin = (import.meta.env.VITE_DRIVE_ORIGIN || "San Francisco, CA").trim();
   const [screen, setScreen] = useState("setup");
   const [skill, setSkill] = useState("Intermediate");
   const [quiver, setQuiver] = useState(["longboard", "shortboard"]);
   const [customBoard, setCustomBoard] = useState("");
-  const [driveOrigin, setDriveOrigin] = useState((import.meta.env.VITE_DRIVE_ORIGIN || "San Francisco, CA").trim());
+  const [driveOrigin, setDriveOrigin] = useState(defaultDriveOrigin);
   const [driveOriginResolved, setDriveOriginResolved] = useState(null);
   const [driveOriginStatus, setDriveOriginStatus] = useState("");
   const [driveOriginOptions, setDriveOriginOptions] = useState([]);
   const [driveOriginOptionsLoading, setDriveOriginOptionsLoading] = useState(false);
   const [showDriveOriginOptions, setShowDriveOriginOptions] = useState(false);
+  const [prefsReady, setPrefsReady] = useState(() => !user?.id);
   const [spots, setSpots] = useState(SPOTS);
   const [spotData, setSpotData] = useState({});
   const [driveTimes, setDriveTimes] = useState({});
@@ -2452,24 +3120,221 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
   const [addSpotName, setAddSpotName] = useState("");
   const [addSpotStatus, setAddSpotStatus] = useState("");
   const [addSpotLoading, setAddSpotLoading] = useState(false);
+  const [surfSessions, setSurfSessions] = useState([]);
+  const [logSessionOpen, setLogSessionOpen] = useState(false);
+  const [mySessionsOpen, setMySessionsOpen] = useState(false);
+  const [forecastDate, setForecastDate] = useState(() => todayForecastDate());
+  const [spotForecastRaw, setSpotForecastRaw] = useState({});
+  const [spotDataCache, setSpotDataCache] = useState({});
 
   const toggleBoard = id => setQuiver(q => q.includes(id) ? q.filter(x => x !== id) : [...q, id]);
 
+  const applyUserProfile = profile => {
+    if (!profile) return;
+    setSkill(profile.skill || "Intermediate");
+    if (Array.isArray(profile.quiver)) setQuiver(profile.quiver);
+    setCustomBoard(profile.customBoard || "");
+    if (profile.driveOrigin) {
+      setDriveOrigin(profile.driveOrigin);
+      setDriveOriginStatus(`Using saved location: ${profile.driveOrigin}`);
+    }
+    if (profile.driveOriginResolved) setDriveOriginResolved(profile.driveOriginResolved);
+  };
+
+  const resolveDriveOriginCoords = async (origin, existingResolved) => {
+    if (existingResolved?.lat != null && existingResolved?.lon != null) return existingResolved;
+    const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
+    const raw = String(origin || "").trim();
+    if (!raw || !apiKey) return null;
+    const resolved = await resolveTomTomLocation(raw, apiKey);
+    return resolved ? { lat: resolved.lat, lon: resolved.lon } : null;
+  };
+
+  const rebuildSpotForDate = (spotId, dateStr, rawOverride = null) => {
+    const spot = spots.find(s => s.id === spotId);
+    const raw = rawOverride || spotForecastRaw[spotId];
+    if (!spot || !raw?.marine?.hourly) return null;
+    const rebuilt = buildSpotCondition(
+      spot,
+      raw.marine,
+      raw.wind,
+      buoyByStation,
+      tidesByStation[spot.tideStationId] || [],
+      dateStr
+    );
+    return rebuilt;
+  };
+
+  const applyForecastDate = (dateStr, { resetAi = true } = {}) => {
+    const { min, max } = getForecastDateBounds();
+    const clamped = dateStr < min ? min : dateStr > max ? max : dateStr;
+
+    setForecastDate(clamped);
+    if (resetAi) {
+      setAiCalled(false);
+      setAiRec({ text: "", loading: false, retryAttempt: 1, maxAttempts: 1 });
+    }
+
+    const cached = spotDataCache[clamped];
+    if (cached && spots.every(s => cached[s.id])) {
+      setSpotData(cached);
+      return cached;
+    }
+
+    const merged = { ...(cached || {}) };
+    for (const spot of spots) {
+      if (merged[spot.id]) continue;
+      const rebuilt = rebuildSpotForDate(spot.id, clamped);
+      if (rebuilt) merged[spot.id] = rebuilt;
+    }
+
+    setSpotDataCache(prev => ({ ...prev, [clamped]: merged }));
+    setSpotData(merged);
+    return merged;
+  };
+
+  const handleForecastDateChange = dateStr => {
+    applyForecastDate(dateStr);
+  };
+
+  const loadData = async (prefsOverride = null) => {
+    const prefs = {
+      skill: prefsOverride?.skill ?? skill,
+      quiver: prefsOverride?.quiver ?? quiver,
+      customBoard: prefsOverride?.customBoard ?? customBoard,
+      driveOrigin: prefsOverride?.driveOrigin ?? driveOrigin,
+      driveOriginResolved: prefsOverride?.driveOriginResolved ?? driveOriginResolved,
+    };
+
+    if (prefsOverride) applyUserProfile(prefsOverride);
+
+    if (user?.id) {
+      const saveResult = await saveUserProfile(user.id, prefs);
+      if (!saveResult.ok) {
+        console.warn("[surf] preferences saved locally; Supabase:", saveResult.error);
+      }
+    }
+    setScreen("loading");
+    try {
+      const marines = await Promise.all(spots.map(s => fetchMarine(s.lat, s.lon).catch(() => null)));
+      const winds = await Promise.all(
+        marines.map((m, i) => {
+          const lat = m?.latitude ?? spots[i].lat;
+          const lon = m?.longitude ?? spots[i].lon;
+          return fetchWind(lat, lon).catch(() => null);
+        })
+      );
+      const uniqueTideIds = [...new Set(spots.map(s => s.tideStationId))];
+      const tideJsons = await Promise.all(
+        uniqueTideIds.map(id => fetchTides(id).catch(() => ({ predictions: [] })))
+      );
+      const ndbcIds = [...new Set(spots.map(s => getNdbcStationIdForSpot(s)))];
+      const nextBuoyByStation = await fetchNdbcBuoysByStation(ndbcIds);
+      const resolved =
+        prefs.driveOriginResolved ||
+        (await resolveDriveOriginCoords(prefs.driveOrigin, prefs.driveOriginResolved));
+      if (resolved) {
+        setDriveOriginResolved(resolved);
+        prefs.driveOriginResolved = resolved;
+        if (user?.id) {
+          await saveUserProfile(user.id, prefs);
+        }
+      }
+      const originForRouting = resolved ? `${resolved.lat},${resolved.lon}` : prefs.driveOrigin;
+      const nextDriveTimes = await fetchDriveTimes(spots, originForRouting);
+      const nextTidesByStation = {};
+      uniqueTideIds.forEach((id, i) => {
+        nextTidesByStation[id] = tideJsons[i]?.predictions || [];
+      });
+
+      const today = todayForecastDate();
+      const rawBySpot = {};
+      spots.forEach((spot, i) => {
+        rawBySpot[spot.id] = { marine: marines[i], wind: winds[i] };
+      });
+      const data = buildSpotDataMapForDate(spots, rawBySpot, nextBuoyByStation, nextTidesByStation, today);
+
+      setSpotData(data);
+      setSpotForecastRaw(rawBySpot);
+      setSpotDataCache({ [today]: data });
+      setForecastDate(today);
+      setAiCalled(false);
+      setAiRec({ text: "", loading: false, retryAttempt: 1, maxAttempts: 1 });
+      setBuoyByStation(nextBuoyByStation);
+      setSpotRetryTick(0);
+      setDriveTimes(nextDriveTimes);
+      setDriveRetryTick(0);
+      setTidesByStation(nextTidesByStation);
+      const topSpot = rankSpots(spots, data, nextTidesByStation, nextDriveTimes, surfSessions)[0];
+      if (topSpot) setActiveSpot(topSpot);
+      setScreen("dashboard");
+    } catch (err) {
+      console.error(err);
+      setScreen("dashboard");
+    }
+  };
+
   useEffect(() => {
-    if (!user?.id) return undefined;
+    if (!user?.id) {
+      setPrefsReady(true);
+      return undefined;
+    }
+
     let cancelled = false;
-    loadUserProfile(user.id).then(profile => {
-      if (cancelled || !profile) return;
-      setSkill(profile.skill);
-      if (profile.quiver?.length) setQuiver(profile.quiver);
-      setCustomBoard(profile.customBoard || "");
-      if (profile.driveOrigin) setDriveOrigin(profile.driveOrigin);
-      if (profile.driveOriginResolved) setDriveOriginResolved(profile.driveOriginResolved);
-    });
+    setPrefsReady(false);
+
+    const cached = loadUserProfileLocal(user.id);
+    if (cached) applyUserProfile(cached);
+
+    (async () => {
+      const profile = await loadUserProfile(user.id);
+      if (cancelled) return;
+
+      if (profile) {
+        applyUserProfile(profile);
+        await loadData(profile);
+      }
+      setPrefsReady(true);
+    })();
+
     return () => {
       cancelled = true;
     };
   }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) {
+      setSurfSessions([]);
+      return undefined;
+    }
+
+    let cancelled = false;
+    (async () => {
+      const sessions = await loadSurfSessions(user.id);
+      if (!cancelled) setSurfSessions(sessions);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
+  const handleSaveSession = async sessionInput => {
+    if (!user?.id) return;
+    const result = await saveSurfSession(user.id, sessionInput);
+    if (result.session) {
+      setSurfSessions(prev => [result.session, ...prev.filter(s => s.id !== result.session.id)]);
+    }
+    if (!result.ok) {
+      throw new Error(result.error || "Could not save session");
+    }
+  };
+
+  const handleDeleteSession = async sessionId => {
+    if (!user?.id) return;
+    await deleteSurfSession(user.id, sessionId);
+    setSurfSessions(prev => prev.filter(s => s.id !== sessionId));
+  };
 
   const resolveAndAutofillDriveOrigin = async () => {
     const apiKey = (import.meta.env.VITE_TOMTOM_API_KEY || "").trim();
@@ -2523,7 +3388,7 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
       ...(customBoard.trim() ? [customBoard.trim()] : []),
     ].join(", ") || "unspecified";
 
-    const rankedSpots = sortSpotsByScore(spotsForAi, data, tideData, driveTimes);
+    const rankedSpots = rankSpots(spotsForAi, data, tideData, driveTimes, surfSessions);
     const { system, userMessage } = buildAiRecommendationPrompt({
       user,
       preferences: {
@@ -2539,6 +3404,9 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
       activeSpot,
       computeDisplayScore,
       rankedSpots,
+      surfSessions,
+      forecastDate,
+      forecastDateLabel: formatForecastCenterLabel(forecastDate),
     });
 
     const anthropicUrl = getAnthropicMessagesUrl();
@@ -2585,66 +3453,6 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
       setAiRec({ text: `AI error: ${lastErr}`, loading: false, retryAttempt: maxAttempts, maxAttempts });
     } catch {
       setAiRec({ text: "Could not reach AI. Check your connection and try refreshing.", loading: false, retryAttempt: maxAttempts, maxAttempts });
-    }
-  };
-
-  const loadData = async () => {
-    if (user?.id) {
-      await saveUserProfile(user.id, {
-        skill,
-        quiver,
-        customBoard,
-        driveOrigin,
-        driveOriginResolved,
-      });
-    }
-    setScreen("loading");
-    try {
-      const marines = await Promise.all(spots.map(s => fetchMarine(s.lat, s.lon).catch(() => null)));
-      const winds = await Promise.all(
-        marines.map((m, i) => {
-          const lat = m?.latitude ?? spots[i].lat;
-          const lon = m?.longitude ?? spots[i].lon;
-          return fetchWind(lat, lon).catch(() => null);
-        })
-      );
-      const uniqueTideIds = [...new Set(spots.map(s => s.tideStationId))];
-      const tideJsons = await Promise.all(
-        uniqueTideIds.map(id => fetchTides(id).catch(() => ({ predictions: [] })))
-      );
-      const ndbcIds = [...new Set(spots.map(s => getNdbcStationIdForSpot(s)))];
-      const nextBuoyByStation = await fetchNdbcBuoysByStation(ndbcIds);
-      const resolved = driveOriginResolved || await resolveAndAutofillDriveOrigin();
-      const originForRouting = resolved ? `${resolved.lat},${resolved.lon}` : driveOrigin;
-      const nextDriveTimes = await fetchDriveTimes(spots, originForRouting);
-      const nextTidesByStation = {};
-      uniqueTideIds.forEach((id, i) => {
-        nextTidesByStation[id] = tideJsons[i]?.predictions || [];
-      });
-
-      const data = {};
-      spots.forEach((spot, i) => {
-        data[spot.id] = buildSpotCondition(
-          spot,
-          marines[i],
-          winds[i],
-          nextBuoyByStation,
-          nextTidesByStation[spot.tideStationId] || []
-        );
-      });
-
-      setSpotData(data);
-      setBuoyByStation(nextBuoyByStation);
-      setSpotRetryTick(0);
-      setDriveTimes(nextDriveTimes);
-      setDriveRetryTick(0);
-      setTidesByStation(nextTidesByStation);
-      const topSpot = sortSpotsByScore(spots, data, nextTidesByStation, nextDriveTimes)[0];
-      if (topSpot) setActiveSpot(topSpot);
-      setScreen("dashboard");
-    } catch (err) {
-      console.error(err);
-      setScreen("dashboard");
     }
   };
 
@@ -2716,9 +3524,19 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
         setBuoyByStation(buoysForFetch);
       }
 
-      const condition = await fetchSpotCondition(nextSpot, buoysForFetch);
-      if (condition) {
-        setSpotData(prev => ({ ...prev, [nextSpot.id]: condition }));
+      const bundle = await fetchSpotForecastBundle(
+        nextSpot,
+        buoysForFetch,
+        tidesByStation[nextSpot.tideStationId] || [],
+        forecastDate
+      );
+      if (bundle?.condition) {
+        setSpotData(prev => ({ ...prev, [nextSpot.id]: bundle.condition }));
+        setSpotForecastRaw(prev => ({ ...prev, [nextSpot.id]: { marine: bundle.marine, wind: bundle.wind } }));
+        setSpotDataCache(prev => ({
+          ...prev,
+          [forecastDate]: { ...(prev[forecastDate] || {}), [nextSpot.id]: bundle.condition },
+        }));
       }
 
       const originForRouting = driveOriginResolved
@@ -2780,22 +3598,41 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
     if (spotRetryTick >= 6) return; // Stop after ~1 minute of retries.
 
     const timer = setTimeout(async () => {
-      const recovered = await fetchMissingSpotData(spots, spotData, buoyByStation);
-      if (Object.keys(recovered).length) {
-        setSpotData(prev => ({ ...prev, ...recovered }));
+      const recovered = await fetchMissingSpotData(
+        spots,
+        spotData,
+        buoyByStation,
+        tidesByStation,
+        forecastDate
+      );
+      if (Object.keys(recovered.spotData).length) {
+        setSpotData(prev => ({ ...prev, ...recovered.spotData }));
+        setSpotForecastRaw(prev => ({ ...prev, ...recovered.rawBySpot }));
+        setSpotDataCache(prev => ({
+          ...prev,
+          [forecastDate]: { ...(prev[forecastDate] || {}), ...recovered.spotData },
+        }));
       }
       setSpotRetryTick(t => t + 1);
     }, 10000);
 
     return () => clearTimeout(timer);
-  }, [screen, spotData, spotRetryTick, spots, buoyByStation]);
+  }, [screen, spotData, spotRetryTick, spots, buoyByStation, tidesByStation, forecastDate]);
 
   useEffect(() => {
     if (!activeSpot || spots.some(s => s.id === activeSpot.id)) return;
-    const topSpot = sortSpotsByScore(spots, spotData, tidesByStation, driveTimes)[0];
+    const topSpot = rankSpots(spots, spotData, tidesByStation, driveTimes, surfSessions)[0];
     setActiveSpot(topSpot || spots[0]);
-  }, [spots, activeSpot, spotData, tidesByStation, driveTimes]);
+  }, [spots, activeSpot, spotData, tidesByStation, driveTimes, surfSessions]);
 
+  if (!prefsReady) {
+    return (
+      <LoadingScreen
+        spotCount={spots.length}
+        subtitle={user?.id ? "Loading your saved preferences…" : undefined}
+      />
+    );
+  }
   if (screen === "setup") return (
     <SetupScreen skill={skill} setSkill={setSkill} quiver={quiver}
       toggleBoard={toggleBoard} customBoard={customBoard}
@@ -2836,6 +3673,16 @@ export function SurfDashboard({ user, onLogin, onLogout }) {
         setAddSpotStatus("");
       }}
       addSpotStatus={addSpotStatus} addSpotLoading={addSpotLoading}
-      onAddSpot={handleAddSpot} />
+      onAddSpot={handleAddSpot}
+      surfSessions={surfSessions}
+      logSessionOpen={logSessionOpen}
+      setLogSessionOpen={setLogSessionOpen}
+      mySessionsOpen={mySessionsOpen}
+      setMySessionsOpen={setMySessionsOpen}
+      onSaveSession={handleSaveSession}
+      onDeleteSession={handleDeleteSession}
+      getSpotScoringConfig={getSpotScoringConfig}
+      forecastDate={forecastDate}
+      onForecastDateChange={handleForecastDateChange} />
   );
 }

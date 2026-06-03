@@ -2,6 +2,8 @@
  * Builds detailed AI coach prompts from app scoring + user preferences.
  */
 
+import { summarizeSessionHistoryForAi } from "./sessionSimilarity.js";
+
 const degToCompass = deg => {
   const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
   return dirs[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
@@ -74,6 +76,15 @@ export const pickBestScoreWindow = (dayForecastPoints = []) => {
   return best;
 };
 
+const formatHourlySeries = (dayForecastPoints = []) =>
+  (dayForecastPoints || []).map(formatHourlyLine).filter(Boolean).join("\n");
+
+const formatBestWindowLine = dayForecastPoints => {
+  const bestWindow = pickBestScoreWindow(dayForecastPoints);
+  if (!bestWindow) return "";
+  return `Peak hourly window: ${fmtHour(bestWindow.start.time)}–${fmtHour(bestWindow.end.time)} (avg score ${Math.round(bestWindow.avgScore)})`;
+};
+
 const formatSpotBlock = ({ spot, data, scoreResult, driveTime, rank, userSkill }) => {
   if (!spot || !data) return `${rank}. ${spot?.name || "Unknown"}: no data`;
 
@@ -88,23 +99,29 @@ const formatSpotBlock = ({ spot, data, scoreResult, driveTime, rank, userSkill }
         ? "spot is a step up from surfer skill — be conservative"
         : "skill level appropriate";
 
+  const bestWindowLine = formatBestWindowLine(data.dayForecastPoints);
+  const timeLabel = data.isForecastToday === false ? "Midday" : "Now";
+
   const lines = [
     `#${rank} ${spot.name} (${spot.type}, spot difficulty: ${spot.difficulty})`,
     `  App quality score: ${score}/100 (${rating}) — primary ranking signal`,
     `  Component scores: ${breakdown}`,
-    `  Now: ${fmtFt(data.surfHeightFt)}ft face (${data.surfHeightDescriptor || "—"}), ${Number(data.swellPeriod)?.toFixed(0) || "—"}s swell from ${degToCompass(data.swellDir)} (${Math.round(data.swellDir || 0)}°)`,
+    `  ${timeLabel}: ${fmtFt(data.surfHeightFt)}ft face (${data.surfHeightDescriptor || "—"}), ${Number(data.swellPeriod)?.toFixed(0) || "—"}s swell from ${degToCompass(data.swellDir)} (${Math.round(data.swellDir || 0)}°)`,
     `  Wind: ${Number(data.windSpeed)?.toFixed(0) || "—"}mph from ${degToCompass(data.windDir)}`,
-    `  Forecast source (now): ${data.forecastSource || "model"}${data.buoyHsFt != null ? `, buoy ${fmtFt(data.buoyHsFt)}ft` : ""}`,
+    `  Forecast source (${timeLabel.toLowerCase()}): ${data.forecastSource || "model"}${data.buoyHsFt != null ? `, buoy ${fmtFt(data.buoyHsFt)}ft` : ""}`,
+    bestWindowLine ? `  ${bestWindowLine}` : "  Peak hourly window: (no hourly series loaded)",
     `  Drive from start: ${driveTime || "unknown"}`,
     `  Surfer fit: ${skillNote}`,
   ];
   return lines.join("\n");
 };
 
-const formatTideBlock = (spots, tidesByStation) =>
+const formatTideBlock = (spots, tidesByStation, forecastDate = null) =>
   spots
     .map(s => {
-      const preds = tidesByStation?.[s.tideStationId] || [];
+      const preds = forecastDate
+        ? (tidesByStation?.[s.tideStationId] || []).filter(p => String(p?.t || "").startsWith(forecastDate))
+        : tidesByStation?.[s.tideStationId] || [];
       const line = preds
         .slice(0, 10)
         .map(t => `${t.t}: ${t.type === "H" ? "High" : "Low"} ${parseFloat(t.v).toFixed(1)}ft`)
@@ -112,6 +129,23 @@ const formatTideBlock = (spots, tidesByStation) =>
       return `${s.name} — NOAA ${s.tideStationId}: ${line || "no predictions"}`;
     })
     .join("\n");
+
+const formatTopSpotsHourlySection = (orderedSpots, spotData, limit = 3) => {
+  const blocks = orderedSpots.slice(0, limit).map((spot, i) => {
+    const data = spotData[spot.id];
+    if (!data?.dayForecastPoints?.length) {
+      return `#${i + 1} ${spot.name}\n  (no hourly series loaded)`;
+    }
+    const hourly = formatHourlySeries(data.dayForecastPoints);
+    const windowLine = formatBestWindowLine(data.dayForecastPoints);
+    return [
+      `#${i + 1} ${spot.name}${windowLine ? ` — ${windowLine}` : ""}`,
+      hourly || "  (no hourly series)",
+    ].join("\n");
+  });
+  if (!blocks.length) return "";
+  return blocks.join("\n\n");
+};
 
 /**
  * @param {object} params
@@ -124,6 +158,8 @@ const formatTideBlock = (spots, tidesByStation) =>
  * @param {object} params.activeSpot
  * @param {(spot: object, data: object, tides: object) => object|null} params.computeDisplayScore
  * @param {object[]} params.rankedSpots optional pre-sorted; if omitted, uses spots order
+ * @param {string} [params.forecastDate]
+ * @param {string} [params.forecastDateLabel]
  */
 export function buildAiRecommendationPrompt({
   user,
@@ -135,6 +171,9 @@ export function buildAiRecommendationPrompt({
   activeSpot,
   computeDisplayScore,
   rankedSpots,
+  surfSessions = [],
+  forecastDate = null,
+  forecastDateLabel = "today",
 }) {
   const { skill, quiverDesc, customBoard, driveOrigin } = preferences;
   const ordered =
@@ -160,21 +199,18 @@ export function buildAiRecommendationPrompt({
     })
     .join("\n\n");
 
+  const topSpotsHourlySection = formatTopSpotsHourlySection(ordered, spotData, 3);
+  const topSpotIds = new Set(ordered.slice(0, 3).map(s => s.id));
+
   const activeData = activeSpot ? spotData[activeSpot.id] : null;
   const activeScore = activeSpot ? computeDisplayScore(activeSpot, activeData, tidesByStation) : null;
   let activeSection = "";
-  if (activeSpot && activeData) {
-    const hourly = (activeData.dayForecastPoints || [])
-      .map(formatHourlyLine)
-      .filter(Boolean)
-      .join("\n");
-    const bestWindow = pickBestScoreWindow(activeData.dayForecastPoints);
-    const windowLine = bestWindow
-      ? `Suggested peak quality window (by hourly app scores): ${fmtHour(bestWindow.start.time)}–${fmtHour(bestWindow.end.time)} (avg score ${Math.round(bestWindow.avgScore)})`
-      : "";
+  if (activeSpot && activeData && !topSpotIds.has(activeSpot.id)) {
+    const hourly = formatHourlySeries(activeData.dayForecastPoints);
+    const windowLine = formatBestWindowLine(activeData.dayForecastPoints);
 
     activeSection = [
-      `USER IS VIEWING: ${activeSpot.name}`,
+      `USER IS VIEWING (not in top 3 ranked): ${activeSpot.name}`,
       formatSpotBlock({
         spot: activeSpot,
         data: activeData,
@@ -184,38 +220,62 @@ export function buildAiRecommendationPrompt({
         userSkill: skill,
       }),
       windowLine,
-      "24-hour forecast at this spot (hourly face height + app quality score):",
+      "24-hour forecast at viewed spot (hourly face height + app quality score):",
       hourly || "  (no hourly series)",
     ]
       .filter(Boolean)
       .join("\n\n");
+  } else if (activeSpot && topSpotIds.has(activeSpot.id)) {
+    activeSection = `USER IS VIEWING: ${activeSpot.name} (hourly data for this spot is in TOP SPOTS HOURLY FORECASTS below)`;
   }
 
   const twelveHourSeries = activeData?.forecastWave?.length
     ? activeData.forecastWave.map((ft, i) => `${i}h+${fmtFt(ft)}ft`).join(", ")
     : null;
 
-  const system = `You are an expert Bay Area surf coach writing directly to the surfer. Address them only in second person ("you", "your") — never use their name, email, or third person ("the surfer", "they"). Recommendations MUST use the app's quality scores (0–100) and component breakdowns as the primary signal — not raw swell height alone. Respect their skill level and quiver. Do not recommend expert-only breaks to beginners. Prefer higher-ranked spots unless drive time or skill makes a lower-ranked spot clearly better. Use real surf lingo. Be direct and specific with numbers from the data.`;
+  const spotNameById = Object.fromEntries(spots.map(s => [s.id, s.name]));
+  const sessionSummary = summarizeSessionHistoryForAi(surfSessions, spotNameById);
+  const sessionBlock = sessionSummary?.text
+    ? `\nSESSION HISTORY (surf quality ratings — not crowds)\n${sessionSummary.text}\n`
+    : "";
 
-  const userMessage = `Give a concise session recommendation for today. Write entirely in second person (you/your). Do not use my name or email.
+  const systemBase = `You are an expert Bay Area surf coach writing directly to the surfer. Address them only in second person ("you", "your") — never use their name, email, or third person ("the surfer", "they"). Recommendations MUST use the app's quality scores (0–100) and component breakdowns as the primary signal — not raw swell height alone. Respect their skill level and quiver. Do not recommend expert-only breaks to beginners. Prefer higher-ranked spots unless drive time or skill makes a lower-ranked spot clearly better. Use real surf lingo. Be direct and specific with numbers from the data. Each ranked spot includes its own peak hourly window; full hourly series are provided for the top 3 ranked spots. Never infer one spot's timing from another spot's forecast — use only that spot's hourly data for Best Window.`;
+
+  const sessionGuidance = sessionSummary
+    ? sessionSummary.tier === "rich"
+      ? " When session history is provided, use it as a secondary tie-breaker: favor spots whose forecast resembles conditions on days they rated 4–5★ for surf quality — but never override a clearly better forecast score."
+      : sessionSummary.tier === "medium"
+        ? " If session history is provided, lightly favor spots resembling their past 4–5★ surf-quality days when scores are close."
+        : " If a past session is listed, you may mention it briefly when relevant — forecast scores still decide."
+    : "";
+
+  const system = `${systemBase}${sessionGuidance}`;
+
+  const userMessage = `Give a concise session recommendation for ${forecastDateLabel}. Write entirely in second person (you/your). Do not use my name or email.
+
+FORECAST DAY: ${forecastDateLabel}${forecastDate ? ` (${forecastDate})` : ""}
+All spot scores, hourly series, and tide schedules below are for this forecast day across every spot.
 
 SURFER PROFILE
 - Skill: ${skill}
 - Quiver: ${quiverDesc}${customBoard?.trim() ? ` (also: ${customBoard.trim()})` : ""}
 - Start location (drive times calculated from here): ${driveOrigin || "not set"}
 ${user ? "- Logged in (preferences saved)" : "- Guest session (preferences apply this visit only)"}
-
-SPOT RANKINGS (sorted by app quality score — #1 is best conditions right now)
+${sessionBlock}
+SPOT RANKINGS (sorted by app quality score for ${forecastDateLabel} — #1 is best conditions that day)
 ${spotRankings}
 
-${activeSection ? `ACTIVE SPOT DETAIL\n${activeSection}\n` : ""}
-${twelveHourSeries ? `Next 12h face-height trend at active spot (from now): ${twelveHourSeries}\n` : ""}
-TIDE SCHEDULE (nearest NOAA station per spot)
-${formatTideBlock(spots, tidesByStation)}
+TOP SPOTS — HOURLY FORECASTS for ${forecastDateLabel} (24h face height + app quality score; use these for Best Window at the spot you recommend)
+${topSpotsHourlySection || "(no hourly series loaded)"}
+
+${activeSection ? `UI CONTEXT\n${activeSection}\n` : ""}
+${twelveHourSeries ? `Next 12h face-height trend at viewed spot on ${forecastDateLabel}: ${twelveHourSeries}\n` : ""}
+TIDE SCHEDULE for ${forecastDateLabel} (nearest NOAA station per spot)
+${formatTideBlock(spots, tidesByStation, forecastDate)}
 
 Provide exactly these 5 sections, each as its own paragraph starting with the bold header:
 **Best Spot** — pick using rankings + skill + drive; cite score/rating and why it beats alternatives.
-**Best Window** — exact time range today using tide schedule and hourly scores (especially active spot if provided).
+**Best Window** — exact time range at the spot you picked in Best Spot, using that spot's hourly scores and peak window from the data above (never another spot's hourly series).
 **Board Pick** — which board from your quiver to grab, with technical reason tied to size, period, and skill.
 **In the Water** — crowds, hazards, vibe; 2–3 sentences.
 **Local Tip** — one insider tip for the chosen spot.

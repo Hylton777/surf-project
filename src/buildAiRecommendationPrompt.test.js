@@ -77,6 +77,107 @@ describe("buildAiRecommendationPrompt", () => {
     assert.ok(userMessage.includes("Longboard"));
     assert.ok(userMessage.includes("San Francisco"));
     assert.ok(userMessage.includes("**Best Spot**"));
-    assert.ok(userMessage.includes("hourly app scores"));
+    assert.ok(userMessage.includes("TOP SPOTS — HOURLY FORECASTS"));
+    assert.ok(userMessage.includes("app quality score"));
+  });
+
+  it("includes session history when provided", () => {
+    const spot = {
+      id: "ob",
+      name: "Ocean Beach",
+      type: "Beach Break",
+      difficulty: "Intermediate",
+      tideStationId: "9414290",
+    };
+    const { userMessage } = buildAiRecommendationPrompt({
+      user: { email: "test@example.com" },
+      preferences: { skill: "Intermediate", quiverDesc: "Longboard", driveOrigin: "SF" },
+      spots: [spot],
+      spotData: { ob: { surfHeightFt: 3, swellPeriod: 12, swellDir: 300, windSpeed: 8, windDir: 270 } },
+      tidesByStation: {},
+      driveTimes: {},
+      activeSpot: spot,
+      computeDisplayScore: () => ({ score: 70, rating: "Good", breakdown: {} }),
+      surfSessions: [{
+        spotId: "ob",
+        spotName: "Ocean Beach",
+        sessionDate: "2026-05-01",
+        startTime: "07:00",
+        endTime: "09:00",
+        stars: 5,
+        forecastSnapshot: { avg: { surfHeightFt: 4, swellPeriod: 12, score: 82 } },
+      }],
+    });
+
+    assert.ok(userMessage.includes("SESSION HISTORY"));
+    assert.ok(userMessage.includes("Ocean Beach"));
+  });
+
+  it("includes hourly forecasts for top ranked spots, not just active spot", () => {
+    const lindaMar = {
+      id: "linda_mar",
+      name: "Linda Mar",
+      type: "Beach Break",
+      difficulty: "Beginner–Inter",
+      tideStationId: "9414290",
+    };
+    const pleasurePoint = {
+      id: "pleasure_point",
+      name: "Pleasure Point",
+      type: "Point Break",
+      difficulty: "Intermediate",
+      tideStationId: "9413745",
+    };
+    const hourlyPoint = time => ({
+      time,
+      surfHeightFt: 3,
+      score: 70,
+      rating: "Good",
+      swellPeriod: 12,
+      swellDir: 280,
+      windSpeedMph: 6,
+      windClassification: "offshore",
+      tideFt: 2,
+    });
+    const spotData = {
+      linda_mar: {
+        surfHeightFt: 4,
+        swellPeriod: 12,
+        swellDir: 280,
+        windSpeed: 6,
+        windDir: 270,
+        dayForecastPoints: [hourlyPoint("2026-01-01T08:00"), hourlyPoint("2026-01-01T09:00")],
+      },
+      pleasure_point: {
+        surfHeightFt: 3,
+        swellPeriod: 11,
+        swellDir: 290,
+        windSpeed: 8,
+        windDir: 260,
+        dayForecastPoints: [hourlyPoint("2026-01-01T10:00")],
+      },
+    };
+    const computeDisplayScore = (spot, data) => ({
+      score: spot.id === "linda_mar" ? 80 : 65,
+      rating: "Good",
+      breakdown: { heightScore: 80, periodScore: 80, directionScore: 80, windScore: 80, tideScore: 70, windClassification: "offshore" },
+    });
+
+    const { userMessage } = buildAiRecommendationPrompt({
+      user: null,
+      preferences: { skill: "Intermediate", quiverDesc: "Longboard", driveOrigin: "SF" },
+      spots: [lindaMar, pleasurePoint],
+      spotData,
+      tidesByStation: {},
+      driveTimes: {},
+      activeSpot: pleasurePoint,
+      computeDisplayScore,
+      rankedSpots: [lindaMar, pleasurePoint],
+    });
+
+    assert.ok(userMessage.includes("TOP SPOTS — HOURLY FORECASTS"));
+    assert.ok(userMessage.includes("#1 Linda Mar"));
+    assert.ok(userMessage.includes("Peak hourly window"));
+    assert.ok(userMessage.includes("never another spot's hourly series"));
   });
 });

@@ -23,4 +23,5 @@ create policy "Users insert own profile"
 
 create policy "Users update own profile"
   on public.user_profiles for update
-  using (auth.uid() = user_id);
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
