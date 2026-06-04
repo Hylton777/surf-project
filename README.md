@@ -1,6 +1,6 @@
 # Surf Intel — Bay Area Surf Forecast & Coach
 
-**Hylton Harvey · CS153 ·** [surf-project-sable.vercel.app](https://surf-project-sable.vercel.app/) · [GitHub](https://github.com/Hylton777/surf-project)
+**Hylton Harvey · CS153 ·** [surf-project-sable.vercel.app](https://surf-project-sable.vercel.app/) · [GitHub](https://github.com/Hylton777/surf-project) · [Demo video](https://www.youtube.com/watch?v=demR5mERL_g)
 
 ---
 
