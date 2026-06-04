@@ -1,4 +1,4 @@
-import { DEFAULT_WEIGHTS } from "../surfSpotConfigs.js";
+import { DEFAULT_WEIGHTS } from "../data/spotConfigs.js";
 import { getDirectionScore } from "./swellDirection.js";
 import { classifyWind } from "./wind.js";
 

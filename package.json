@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "preview:ai": "node server/anthropic-proxy.mjs & vite preview",
     "proxy:anthropic": "node server/anthropic-proxy.mjs",
-    "test": "node --test src/surfScorer.test.js src/surfForecast.test.js src/buildAiRecommendationPrompt.test.js src/sessionSimilarity.test.js src/ndbcSpecParser.test.js server/claude-upstream.test.js",
+    "test": "node --test src/forecast/surfScorer.test.js src/forecast/surfForecast.test.js src/ai/buildAiRecommendationPrompt.test.js src/sessions/sessionSimilarity.test.js src/services/ndbc/ndbcSpecParser.test.js server/claude-upstream.test.js && npm run test:smoke",
+    "test:smoke": "vite-node scripts/integration-smoke.mjs",
     "calibrate:forecast": "node scripts/calibrate-forecast.mjs"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.10"
+    "vite": "^5.4.10",
+    "vite-node": "^2.1.9"
   }
 }

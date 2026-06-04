@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { SPOT_CONFIGS } from "../surfSpotConfigs.js";
+import { SPOT_CONFIGS } from "../data/spotConfigs.js";
 import {
   adjustSurfPeriod,
   applyBuoyAnchorCorrection,
@@ -358,5 +358,68 @@ describe("computeHourlySurfForecast pipeline", () => {
     );
     assert.ok(new Set(series).size > 1);
     assert.equal(series[hi], anchor.surfHeightFt);
+  });
+});
+
+describe("calibrateSpotConfigFromMarine", () => {
+  it("updates misaligned swell directions using local marine forecast", async () => {
+    const { calibrateSpotConfigFromMarine, computeSurfHeightForecast, marineHourFromArrays } = await import("./surfForecast.js");
+
+    const hourly = {
+      time: ["2026-06-03T10:00", "2026-06-03T11:00", "2026-06-03T12:00"],
+      wave_height: [1.4, 1.4, 1.4],
+      wave_period: [8, 8, 8],
+      wave_peak_period: [9, 9, 9],
+      wave_direction: [320, 320, 320],
+      swell_wave_height: [1.2, 1.2, 1.2],
+      swell_wave_period: [12, 12, 12],
+      swell_wave_peak_period: [13, 13, 13],
+      swell_wave_direction: [320, 320, 320],
+      secondary_swell_wave_height: [0, 0, 0],
+      secondary_swell_wave_period: [0, 0, 0],
+      secondary_swell_wave_peak_period: [0, 0, 0],
+      secondary_swell_wave_direction: [0, 0, 0],
+      wind_wave_height: [0.2, 0.2, 0.2],
+      wind_wave_period: [4, 4, 4],
+      wind_wave_peak_period: [4, 4, 4],
+      wind_wave_direction: [90, 90, 90],
+    };
+
+    const wrongConfig = {
+      break_type: "reef",
+      break_facing_direction: 90,
+      optimal_swell_directions: [90],
+      swell_direction_tolerance: 15,
+      surf_height_scale: 0.62,
+    };
+    const calibrated = calibrateSpotConfigFromMarine(wrongConfig, hourly);
+    const mh = marineHourFromArrays(hourly, 2);
+    const before = computeSurfHeightForecast({ marineHour: mh, spotConfig: wrongConfig }).surfHeightFt;
+    const after = computeSurfHeightForecast({ marineHour: mh, spotConfig: calibrated }).surfHeightFt;
+
+    assert.ok(before < 1);
+    assert.ok(after >= 2);
+  });
+});
+
+describe("computeSurfHeightForecast fallback", () => {
+  it("uses total wave height when directional filtering would round to zero", () => {
+    const marineHour = {
+      waveHeight: 1.4,
+      wavePeriod: 8,
+      swellHeight: 1.2,
+      swellPeriod: 12,
+      swellPeakPeriod: 13,
+      swellDir: 320,
+    };
+    const wrongConfig = {
+      break_type: "reef",
+      break_facing_direction: 90,
+      optimal_swell_directions: [90],
+      swell_direction_tolerance: 15,
+      surf_height_scale: 0.48,
+    };
+    const result = computeSurfHeightForecast({ marineHour, spotConfig: wrongConfig });
+    assert.ok(result.surfHeightFt > 0);
   });
 });

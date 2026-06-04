@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { supabase } from "../supabaseClient.js";
+import { supabase } from "../services/supabaseClient.js";
 
 const THEME = {
   bg: "#dff4ff",

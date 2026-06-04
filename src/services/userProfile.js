@@ -1,4 +1,4 @@
-import { supabase } from "./supabaseClient.js";
+import { supabase } from "../services/supabaseClient.js";
 
 const TABLE = "user_profiles";
 const localKey = userId => `surf_intel_user_profile_${userId}`;

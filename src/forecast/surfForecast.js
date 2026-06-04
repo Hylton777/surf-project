@@ -8,7 +8,7 @@ import {
 } from "./forecastTuning.js";
 import { getDirectionAttenuation, getDirectionScore } from "./swellDirection.js";
 import { classifyWind } from "./wind.js";
-import { getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "../surfSpotConfigs.js";
+import { getDefaultSurfHeightScale, getDefaultSurfPeriodScale } from "../data/spotConfigs.js";
 
 export const M_TO_FT = 3.28084;
 export const BUOY_BLEND_WEIGHT = 0.35;
@@ -348,9 +348,26 @@ export function computeSurfHeightForecast({ marineHour, spotConfig, buoyObservat
     spotConfig?.break_type,
     spotConfig?.face_multiplier
   );
-  const rawSurfHeightFt = roundHalfFt(swellHsFt * faceMultiplier);
   const surfHeightScale = getSurfHeightScale(spotConfig);
-  const surfHeightFt = roundHalfFt(rawSurfHeightFt * surfHeightScale);
+  let rawSurfHeightFt = roundHalfFt(swellHsFt * faceMultiplier);
+  let surfHeightFt = roundHalfFt(rawSurfHeightFt * surfHeightScale);
+
+  if (surfHeightFt <= 0) {
+    const waveHs = Number(marineHour?.waveHeight);
+    if (Number.isFinite(waveHs) && waveHs > 0) {
+      const fallbackHsFt = roundHalfFt(mToFt(waveHs));
+      const fallbackRaw = roundHalfFt(fallbackHsFt * faceMultiplier);
+      const fallbackSurf = roundHalfFt(fallbackRaw * surfHeightScale);
+      if (fallbackSurf > 0) {
+        rawSurfHeightFt = fallbackRaw;
+        surfHeightFt = fallbackSurf;
+        if (directionFactor <= 0.1) {
+          source = "total_wave";
+        }
+      }
+    }
+  }
+
   const descriptor = faceHeightToDescriptor(surfHeightFt);
 
   const buoyHsM = Number.isFinite(Number(buoyObservation?.swellHsM)) && buoyObservation.swellHsM > 0
@@ -544,6 +561,63 @@ export function computeHourlySurfForecast({
     tideFt: Number.isFinite(Number(tideFt)) ? Number(tideFt) : null,
   };
 }
+
+/** Weighted mean swell direction from recent marine hourly samples. */
+export const dominantSwellDirectionFromMarine = marineHourly => {
+  const len = marineHourly?.time?.length || 0;
+  if (!len) return null;
+
+  let sx = 0;
+  let sy = 0;
+  let weight = 0;
+  const start = Math.max(0, len - 48);
+  for (let i = start; i < len; i++) {
+    const marineHour = marineHourFromArrays(marineHourly, i);
+    const components = getSwellComponentsFromMarineHour(marineHour);
+    let strongest = null;
+    for (const component of components) {
+      if (component.dir == null || component.hsM <= 0.15) continue;
+      if (!strongest || component.hsM > strongest.hsM) strongest = component;
+    }
+    if (!strongest) continue;
+    const rad = (strongest.dir * Math.PI) / 180;
+    sx += Math.cos(rad) * strongest.hsM;
+    sy += Math.sin(rad) * strongest.hsM;
+    weight += strongest.hsM;
+  }
+  if (weight <= 0) return null;
+  return ((Math.atan2(sy, sx) * 180) / Math.PI + 360) % 360;
+};
+
+/**
+ * Align AI-generated swell directions with observed marine forecast when they
+ * would zero out surf height at the break.
+ */
+export const calibrateSpotConfigFromMarine = (spotConfig, marineHourly) => {
+  if (!spotConfig || !marineHourly?.time?.length) return spotConfig;
+
+  const dominantDir = dominantSwellDirectionFromMarine(marineHourly);
+  if (dominantDir == null) return spotConfig;
+
+  const score = getDirectionScore(dominantDir, spotConfig);
+  if (score >= 55) return spotConfig;
+
+  const observedDirs = [
+    Math.round(dominantDir),
+    Math.round((dominantDir + 15) % 360),
+    Math.round((dominantDir + 345) % 360),
+  ];
+  const mergedDirs = [...new Set([
+    ...(Array.isArray(spotConfig.optimal_swell_directions) ? spotConfig.optimal_swell_directions : []),
+    ...observedDirs,
+  ])].slice(0, 4);
+
+  return {
+    ...spotConfig,
+    optimal_swell_directions: mergedDirs,
+    notes: `${spotConfig.notes || ""} Swell directions augmented from local marine forecast.`.trim(),
+  };
+};
 
 /** Build marineHour-shaped object from raw Open-Meteo hourly arrays at index i. */
 export const marineHourFromArrays = (hourly, i) => ({

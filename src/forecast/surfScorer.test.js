@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { SPOT_CONFIGS } from "../surfSpotConfigs.js";
+import { SPOT_CONFIGS } from "../data/spotConfigs.js";
 import { classifyWind, computeSurfScore, getDisplayRating } from "./surfScorer.js";
 
 const oceanBeach = SPOT_CONFIGS.find(c => c.id === "ocean_beach_sf");

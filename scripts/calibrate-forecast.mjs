@@ -3,13 +3,13 @@
  * Compare model-only vs buoy vs anchored face height at "now" for built-in spots.
  * Run: node scripts/calibrate-forecast.mjs
  */
-import { SPOT_CONFIGS } from "../surfSpotConfigs.js";
-import { parseNdbcSpecLatest } from "../src/ndbcSpecParser.js";
+import { SPOT_CONFIGS } from "../src/data/spotConfigs.js";
+import { parseNdbcSpecLatest } from "../src/services/ndbc/ndbcSpecParser.js";
 import {
   computeHourlySurfForecast,
   computeSurfHeightForecast,
   marineHourFromArrays,
-} from "../src/surfForecast.js";
+} from "../src/forecast/surfForecast.js";
 
 const MARINE_HOURLY =
   "wave_height,wave_period,wave_peak_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_peak_period,swell_wave_direction,secondary_swell_wave_height,secondary_swell_wave_period,secondary_swell_wave_direction";

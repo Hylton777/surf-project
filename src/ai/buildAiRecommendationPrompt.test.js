@@ -15,6 +15,22 @@ describe("pickBestScoreWindow", () => {
     assert.equal(fmtHour(w.start.time), "10:00");
     assert.ok(w.avgScore >= 85);
   });
+
+  it("ignores overnight hours even when scores are higher", () => {
+    const pts = [
+      { time: "2026-01-01T03:00", score: 99 },
+      { time: "2026-01-01T04:00", score: 98 },
+      { time: "2026-01-01T05:00", score: 97 },
+      { time: "2026-01-01T08:00", score: 50 },
+      { time: "2026-01-01T09:00", score: 60 },
+      { time: "2026-01-01T10:00", score: 70 },
+      { time: "2026-01-01T11:00", score: 65 },
+      { time: "2026-01-01T12:00", score: 60 },
+    ];
+    const w = pickBestScoreWindow(pts);
+    assert.equal(fmtHour(w.start.time), "09:00");
+    assert.ok(w.avgScore < 90);
+  });
 });
 
 function fmtHour(timeStr) {
@@ -163,7 +179,7 @@ describe("buildAiRecommendationPrompt", () => {
       breakdown: { heightScore: 80, periodScore: 80, directionScore: 80, windScore: 80, tideScore: 70, windClassification: "offshore" },
     });
 
-    const { userMessage } = buildAiRecommendationPrompt({
+    const { system, userMessage } = buildAiRecommendationPrompt({
       user: null,
       preferences: { skill: "Intermediate", quiverDesc: "Longboard", driveOrigin: "SF" },
       spots: [lindaMar, pleasurePoint],
@@ -179,5 +195,7 @@ describe("buildAiRecommendationPrompt", () => {
     assert.ok(userMessage.includes("#1 Linda Mar"));
     assert.ok(userMessage.includes("Peak hourly window"));
     assert.ok(userMessage.includes("never another spot's hourly series"));
+    assert.ok(userMessage.includes("6:00 AM and 20:00 PM"));
+    assert.ok(system.includes("never suggest pre-dawn"));
   });
 });

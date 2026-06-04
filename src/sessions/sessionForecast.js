@@ -1,5 +1,5 @@
-import { computeHourlySurfForecast, marineHourFromArrays } from "./surfForecast.js";
-import { computeSurfScore } from "./surfScorer.js";
+import { computeHourlySurfForecast, marineHourFromArrays } from "../forecast/surfForecast.js";
+import { computeSurfScore } from "../forecast/surfScorer.js";
 
 const TZ = "America/Los_Angeles";
 const MPH_TO_KNOTS = 0.868976;

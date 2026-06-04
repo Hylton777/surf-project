@@ -2,12 +2,8 @@
  * Builds detailed AI coach prompts from app scoring + user preferences.
  */
 
-import { summarizeSessionHistoryForAi } from "./sessionSimilarity.js";
-
-const degToCompass = deg => {
-  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
-  return dirs[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
-};
+import { summarizeSessionHistoryForAi } from "../sessions/sessionSimilarity.js";
+import { degToCompass } from "../lib/format.js";
 
 const fmtFt = ft => {
   const n = Number(ft);
@@ -20,6 +16,25 @@ const fmtHour = timeStr => {
   const m = String(timeStr || "").match(/(\d{2}):(\d{2})/);
   return m ? `${m[1]}:${m[2]}` : String(timeStr || "").slice(11, 16) || "—";
 };
+
+/** Local clock hour (0–23) from Open-Meteo hourly time strings. */
+export const hourFromForecastTime = timeStr => {
+  const m = String(timeStr || "").match(/[\sT](\d{2}):(\d{2})/);
+  return m ? Number(m[1]) : NaN;
+};
+
+/** Practical surf session hours (local time) — excludes overnight model peaks. */
+export const WAKING_SURF_HOUR_MIN = 6;
+export const WAKING_SURF_HOUR_MAX = 20;
+
+export const isWakingSurfHour = timeStr => {
+  const h = hourFromForecastTime(timeStr);
+  if (!Number.isFinite(h)) return false;
+  return h >= WAKING_SURF_HOUR_MIN && h <= WAKING_SURF_HOUR_MAX;
+};
+
+export const filterWakingSurfHours = (dayForecastPoints = []) =>
+  (dayForecastPoints || []).filter(p => isWakingSurfHour(p?.time));
 
 const skillLevelRank = skill => {
   const s = String(skill || "").toLowerCase();
@@ -57,9 +72,9 @@ const formatHourlyLine = p => {
   );
 };
 
-/** Pick 2–3 hour window with highest average hourly score. */
+/** Pick 2–3 hour window with highest average hourly score (waking hours only). */
 export const pickBestScoreWindow = (dayForecastPoints = []) => {
-  const pts = dayForecastPoints.filter(p => Number.isFinite(p.score));
+  const pts = filterWakingSurfHours(dayForecastPoints).filter(p => Number.isFinite(p.score));
   if (!pts.length) return null;
   if (pts.length <= 2) {
     return { start: pts[0], end: pts[pts.length - 1], avgScore: pts[0].score };
@@ -82,7 +97,7 @@ const formatHourlySeries = (dayForecastPoints = []) =>
 const formatBestWindowLine = dayForecastPoints => {
   const bestWindow = pickBestScoreWindow(dayForecastPoints);
   if (!bestWindow) return "";
-  return `Peak hourly window: ${fmtHour(bestWindow.start.time)}–${fmtHour(bestWindow.end.time)} (avg score ${Math.round(bestWindow.avgScore)})`;
+  return `Peak hourly window (${WAKING_SURF_HOUR_MIN}:00–${WAKING_SURF_HOUR_MAX}:00): ${fmtHour(bestWindow.start.time)}–${fmtHour(bestWindow.end.time)} (avg score ${Math.round(bestWindow.avgScore)})`;
 };
 
 const formatSpotBlock = ({ spot, data, scoreResult, driveTime, rank, userSkill }) => {
@@ -239,7 +254,7 @@ export function buildAiRecommendationPrompt({
     ? `\nSESSION HISTORY (surf quality ratings — not crowds)\n${sessionSummary.text}\n`
     : "";
 
-  const systemBase = `You are an expert Bay Area surf coach writing directly to the surfer. Address them only in second person ("you", "your") — never use their name, email, or third person ("the surfer", "they"). Recommendations MUST use the app's quality scores (0–100) and component breakdowns as the primary signal — not raw swell height alone. Respect their skill level and quiver. Do not recommend expert-only breaks to beginners. Prefer higher-ranked spots unless drive time or skill makes a lower-ranked spot clearly better. Use real surf lingo. Be direct and specific with numbers from the data. Each ranked spot includes its own peak hourly window; full hourly series are provided for the top 3 ranked spots. Never infer one spot's timing from another spot's forecast — use only that spot's hourly data for Best Window.`;
+  const systemBase = `You are an expert Bay Area surf coach writing directly to the surfer. Address them only in second person ("you", "your") — never use their name, email, or third person ("the surfer", "they"). Recommendations MUST use the app's quality scores (0–100) and component breakdowns as the primary signal — not raw swell height alone. Respect their skill level and quiver. Do not recommend expert-only breaks to beginners. Prefer higher-ranked spots unless drive time or skill makes a lower-ranked spot clearly better. Use real surf lingo. Be direct and specific with numbers from the data. Each ranked spot includes its own peak hourly window (already limited to ${WAKING_SURF_HOUR_MIN}:00–${WAKING_SURF_HOUR_MAX}:00 local time); full hourly series are provided for the top 3 ranked spots. Never infer one spot's timing from another spot's forecast — use only that spot's hourly data for Best Window. For **Best Window**, you MUST recommend a time between ${WAKING_SURF_HOUR_MIN}:00 AM and ${WAKING_SURF_HOUR_MAX}:00 PM local time only — never suggest pre-dawn, middle-of-the-night, or late-night sessions even if overnight hours look good in the raw series.`;
 
   const sessionGuidance = sessionSummary
     ? sessionSummary.tier === "rich"
@@ -275,7 +290,7 @@ ${formatTideBlock(spots, tidesByStation, forecastDate)}
 
 Provide exactly these 5 sections, each as its own paragraph starting with the bold header:
 **Best Spot** — pick using rankings + skill + drive; cite score/rating and why it beats alternatives.
-**Best Window** — exact time range at the spot you picked in Best Spot, using that spot's hourly scores and peak window from the data above (never another spot's hourly series).
+**Best Window** — exact time range at the spot you picked in Best Spot, using that spot's hourly scores and peak window from the data above (never another spot's hourly series). Must be between ${WAKING_SURF_HOUR_MIN}:00 AM and ${WAKING_SURF_HOUR_MAX}:00 PM local time (waking / daylight surf hours only).
 **Board Pick** — which board from your quiver to grab, with technical reason tied to size, period, and skill.
 **In the Water** — crowds, hazards, vibe; 2–3 sentences.
 **Local Tip** — one insider tip for the chosen spot.
